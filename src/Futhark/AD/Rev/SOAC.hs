@@ -12,6 +12,7 @@ import Futhark.AD.Rev.Monad
 import Futhark.AD.Rev.Reduce
 import Futhark.AD.Rev.Scan
 import Futhark.AD.Rev.Scatter
+import Futhark.AD.Rev.Hist
 import Futhark.Analysis.PrimExp.Convert
 import Futhark.Builder
 import Futhark.IR.SOACS
@@ -44,6 +45,20 @@ commonSOAC pat aux soac m = do
   m
   returnSweepCode $ mapM lookupAdj $ patNames pat
 
+isMinMaxOp :: BinOp -> Bool
+isMinMaxOp (SMin _) = True
+isMinMaxOp (UMin _) = True
+isMinMaxOp (FMin _) = True
+isMinMaxOp (SMax _) = True
+isMinMaxOp (UMax _) = True
+isMinMaxOp (FMax _) = True
+isMinMaxOp _ = False
+
+isMulOp :: BinOp -> Bool
+isMulOp (Mul _ _)   = True
+isMulOp (FMul _)    = True 
+isMulOp _           = False
+
 vjpSOAC :: VjpOps -> Pat -> StmAux () -> SOAC SOACS -> ADM () -> ADM ()
 vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just reds <- isReduceSOAC form,
@@ -59,14 +74,6 @@ vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just red <- singleReduce <$> isReduceSOAC form = do
     pat_adj <- mapM adjVal =<< commonSOAC pat aux soac m
     diffReduce ops pat_adj w as red
-  where
-    isMinMaxOp (SMin _) = True
-    isMinMaxOp (UMin _) = True
-    isMinMaxOp (FMin _) = True
-    isMinMaxOp (SMax _) = True
-    isMinMaxOp (UMax _) = True
-    isMinMaxOp (FMax _) = True
-    isMinMaxOp _ = False
 vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just scans <- isScanSOAC form,
     length scans > 1 =
@@ -86,5 +93,12 @@ vjpSOAC ops pat _aux (Screma w as form) m
     vjpStm ops mapstm $ vjpStm ops redstm m
 vjpSOAC ops pat aux (Scatter w lam ass written_info) m =
   vjpScatter ops pat aux (w, lam, ass, written_info) m
+vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
+  | isIdentityLambda f,
+    [x] <- patNames pat,
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop, 
+    Just [(op, _, _, _)] <- lamIsBinOp lam,
+    isMinMaxOp op =
+    diffMinMaxHist ops x aux n op ne is vs w rf dst m
 vjpSOAC _ _ _ soac _ =
   error $ "vjpSOAC unhandled:\n" ++ pretty soac
