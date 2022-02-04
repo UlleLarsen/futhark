@@ -21,3 +21,8 @@ entry rev [n] (is: [n]i64) (vs: [n]f32) =
 entry revp [n] (is: [n]i64) (vs: [n]f32) =
   let (res,_) = vjp red_max (is,vs) (replicate 5 0 with [0] = 1)
   in res
+
+def testred [n][m] (dst: *[m]f32, is: [n]i64, vs: [n]f32) =
+  reduce_by_index dst f32.max f32.lowest is vs
+
+entry test [n][m] (dst: *[m]f32) (is: [n]i64) (vs: [n]f32) = vjp testred (dst,is,vs) (replicate m 0 with [0] = 1)

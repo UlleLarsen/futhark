@@ -100,5 +100,11 @@ vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
     Just [(op, _, _, _)] <- lamIsBinOp lam,
     isMinMaxOp op =
     diffMinMaxHist ops x aux n op ne is vs w rf dst m
+  | isIdentityLambda f,
+    [x] <- patNames pat,
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop, 
+    Just [(op, _, _, _)] <- lamIsBinOp lam,
+    isMulOp op =
+    diffMulHist ops x aux n op ne is vs w rf dst m
 vjpSOAC _ _ _ soac _ =
   error $ "vjpSOAC unhandled:\n" ++ pretty soac
