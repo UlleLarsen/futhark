@@ -7,8 +7,6 @@
 
 def red_mul [n] (is: [n]i64) (vs: [n]f32) =
   reduce_by_index (replicate 5 1) (*) 1 is vs
-  --let r = reduce_by_index (replicate 5 0) (+) 0 is vs
-  --in map2 (+) l r
 
 entry rev [n] (is: [n]i64) (vs: [n]f32) =
   vjp (red_mul is) vs (replicate 5 0 with [0] = 1)
