@@ -16,6 +16,7 @@ import Futhark.Builder
 import Futhark.IR.SOACS
 import Futhark.Tools
 import Futhark.Transform.Rename
+import Control.Monad
 
 getBinOpPlus :: PrimType -> BinOp
 getBinOpPlus (IntType x) = Add x OverflowUndef
@@ -40,21 +41,23 @@ onePrimValue Unit = UnitValue
 
 --
 -- special case of histogram with min/max as operator.
--- Original, assuming `is: [n]i64` and `dest: [w]btp`
---     let histo = reduce_by_index dest max ne is vs
+-- Original, assuming `is: [n]i64` and `dst: [w]btp`
+--     let x = reduce_by_index dst minmax ne is vs
 -- Forward trace:
---     let (histo, histo_inds) = map3 (\i v j -> (i,(v,j))) is vs (iota n)
---                       |> reduce_by_index dest argmax (ne,-1)
+--     let (x, x_inds) = zip vs (iota n)
+--                       |> reduce_by_index dst argminmax (ne,-1) is
 --
 -- Reverse trace:
---     dest += map (\m_ind el -> if m_ind == -1 then el else 0
---                 ) histo_inds histo_bar
+--     dst_bar += map (\x_ind b -> if x_ind == -1 
+--                                 then b 
+--                                 else 0
+--                    ) x_inds x_bar
 
---     vs_ctrbs = map2 (\ i h_v -> if i == -1
---                                 then 0
---                                 else vs_bar[i]+h_v
---                     ) histo_inds histo_bar
---     vs_bar <- scatter vs_bar histo_inds vs_ctrbs
+--     vs_ctrbs = map2 (\i b -> if i == -1
+--                              then 0
+--                              else vs_bar[i] + b
+--                     ) x_inds x_bar
+--     vs_bar <- scatter vs_bar x_inds vs_ctrbs
 diffMinMaxHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
@@ -101,51 +104,78 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 
   m
 
-  x_adj <- lookupAdjVal x
+  x_bar <- lookupAdjVal x
 
-  x_ind_dst <- newParam "x_ind_param" $ Prim int64
-  x_adj_dst <- newParam "x_adj_param" $ Prim t
+  x_ind_dst <- newParam (baseString x ++ "_ind_param") $ Prim int64
+  x_bar_dst <- newParam (baseString x ++ "_bar_param") $ Prim t
   dst_lam <-
-    mkLambda [x_ind_dst, x_adj_dst] $
+    mkLambda [x_ind_dst, x_bar_dst] $
       fmap varsRes . letTupExp "res" 
         =<< eIf
           (eCmpOp (CmpEq int64) (eParam x_ind_dst) (eSubExp $ intConst Int64 (-1)))
-          (eBody $ return $ eParam x_adj_dst)
+          (eBody $ return $ eParam x_bar_dst)
           (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
 
   dst_bar <-
     letExp (baseString dst ++ "_bar") $
       Op $
-        Screma w [x_inds, x_adj] $ mapSOAC dst_lam
+        Screma w [x_inds, x_bar] $ mapSOAC dst_lam
 
   updateAdj dst dst_bar
 
-  vs_adj <- lookupAdjVal vs
+  vs_bar <- lookupAdjVal vs
 
-  x_ind_vs <- newParam "x_ind_param" $ Prim int64
-  x_adj_vs <- newParam "x_adj_param" $ Prim t
+  x_ind_vs <- newParam (baseString x ++ "_ind_param") $ Prim int64
+  x_bar_vs <- newParam (baseString x ++ "_bar_param") $ Prim t
   vs_lam <-
-    mkLambda [x_ind_vs, x_adj_vs] $
+    mkLambda [x_ind_vs, x_bar_vs] $
       fmap varsRes . letTupExp "res" 
         =<< eIf
           (eCmpOp (CmpEq int64) (eParam x_ind_vs) (eSubExp $ intConst Int64 (-1)))
           (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
           (eBody $ return $ do
-            vs_bar_i <-
-                    letSubExp (baseString vs_adj ++ "_el") $
-                      BasicOp $
-                        Index vs_adj $ Slice [DimFix $ Var $ paramName x_ind_vs]
-            eBinOp (getBinOpPlus t) (eParam x_adj_vs) (eSubExp vs_bar_i))
+             vs_bar_i <-
+               letSubExp (baseString vs_bar ++ "_el") $
+                 BasicOp $
+                   Index vs_bar $ Slice [DimFix $ Var $ paramName x_ind_vs]
+             eBinOp (getBinOpPlus t) (eParam x_bar_vs) (eSubExp vs_bar_i))
 
   vs_bar_p <-
     letExp (baseString vs ++ "_partial") $
       Op $
-        Screma w [x_inds, x_adj] $ mapSOAC vs_lam
+        Screma w [x_inds, x_bar] $ mapSOAC vs_lam
 
   f'' <- mkIdentityLambda [Prim int64, Prim t]
-  let scatter_soac = Scatter w [x_inds, vs_bar_p] f'' [(Shape [n], 1, vs_adj)]
-  vs_bar' <- letExp (baseString vs ++ "_bar") $ Op scatter_soac
+  vs_bar' <- 
+    letExp (baseString vs ++ "_bar") $ Op $ 
+      Scatter w [x_inds, vs_bar_p] f'' [(Shape [n], 1, vs_bar)]
   insAdj vs vs_bar'
+
+--
+-- special case of histogram with multiplication as operator.
+-- Original, assuming `is: [n]i64` and `dst: [w]btp`
+--     let x = reduce_by_index dst (*) ne is vs
+-- Forward trace:
+--     let (ps, zs) = map (\v -> if x == 0 then (1,1) else (v,0)) vs
+--     let non_zero_prod = reduce_by_index nes (*) ne is ps
+--     let zero_count = reduce_by_index 0s (+) 0 is zs
+--     let h_part = map2 (\p c -> if c == 0 then p else 0
+--                       ) non_zero_prod zero_count
+--     let x = map2 (*) dst h_part
+--
+-- Reverse trace:
+--     dst_bar += map2 (*) h_part x_bar
+
+--     let part_bar = map2 (*) dst x_bar
+--     vs_bar += map2 (\i v -> let zr_cts = zero_count[i]
+--                             let pr_bar = part_bar[i]
+--                             let nz_prd = non_zero_prod[i]
+--                             in if zr_cts == 0
+--                             then pr_bar * (nz_prd / v) 
+--                             else if zr_cts == 1 and v == 0
+--                             then nz_prd * pr_bar
+--                             else 0
+--                    ) is vs
 
 diffMulHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
@@ -218,21 +248,19 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
     mkLambda [j_param, a_param] $
       fmap varsRes . letTupExp "vs_bar" =<< do
         let j = Slice [DimFix $ Var $ paramName j_param]
-        zr_cts <- newVName "zr_cts"
-        pr_bar <- newVName "pr_bar"
-        nz_prd <- newVName "nz_prd"
-        letBindNames [zr_cts] $ BasicOp $ Index zr_counts j
-        letBindNames [pr_bar] $ BasicOp $ Index part_bar j
-        letBindNames [nz_prd] $ BasicOp $ Index nz_prods j
+        names <- traverse newVName ["zr_cts", "pr_bar", "nz_prd"]
+        let [zr_cts, pr_bar, nz_prd] = names
+        zipWithM_ (\name -> letBindNames [name] . BasicOp . flip Index j) names [zr_counts, part_bar, nz_prods]
 
         eIf
           (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 0) (eSubExp $ Var zr_cts))
           (eBody $ return $ eBinOp mul (eSubExp $ Var pr_bar) $ eBinOp (getBinOpDiv t) (eSubExp $ Var nz_prd) $ eParam a_param) 
-          (eBody $ return $ eIf 
-                              (eBinOp LogAnd (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 1) (eSubExp $ Var zr_cts)) 
-                                             (eCmpOp (CmpEq t) (eSubExp $ Constant $ blankPrimValue t) $ eParam a_param))
-                              (eBody $ return $ eBinOp mul (eSubExp $ Var nz_prd) (eSubExp $ Var pr_bar)) 
-                              (eBody $ return $ eSubExp $ Constant $ blankPrimValue t) 
+          (eBody $ return $ 
+            eIf 
+              (eBinOp LogAnd (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 1) (eSubExp $ Var zr_cts)) 
+                            (eCmpOp (CmpEq t) (eSubExp $ Constant $ blankPrimValue t) $ eParam a_param))
+              (eBody $ return $ eBinOp mul (eSubExp $ Var nz_prd) (eSubExp $ Var pr_bar)) 
+              (eBody $ return $ eSubExp $ Constant $ blankPrimValue t) 
           )
   vs_bar <- 
     letExp "vs_bar" $ Op $ Screma n [is, vs] $ mapSOAC lam_vsbar
