@@ -59,6 +59,11 @@ isMulOp (Mul _ _)   = True
 isMulOp (FMul _)    = True 
 isMulOp _           = False
 
+isAddOp :: BinOp -> Bool
+isAddOp (Add _ _)   = True 
+isAddOp (FAdd _)    = True 
+isAddOp _           = False
+
 vjpSOAC :: VjpOps -> Pat -> StmAux () -> SOAC SOACS -> ADM () -> ADM ()
 vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just reds <- isReduceSOAC form,
@@ -106,5 +111,11 @@ vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
     Just [(op, _, _, _)] <- lamIsBinOp lam,
     isMulOp op =
     diffMulHist ops x aux n op ne is vs w rf dst m
+  | isIdentityLambda f,
+    [x] <- patNames pat,
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop, 
+    Just [(op, _, _, _)] <- lamIsBinOp lam,
+    isAddOp op =
+    diffAddHist ops x aux n op ne is vs w rf dst m
 vjpSOAC _ _ _ soac _ =
   error $ "vjpSOAC unhandled:\n" ++ pretty soac

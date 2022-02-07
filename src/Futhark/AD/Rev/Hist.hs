@@ -7,6 +7,7 @@
 module Futhark.AD.Rev.Hist
   ( diffMinMaxHist,
     diffMulHist,
+    diffAddHist, 
   )
 where
 
@@ -38,6 +39,11 @@ onePrimValue (FloatType Float32) = FloatValue $ Float32Value 1.0
 onePrimValue (FloatType Float64) = FloatValue $ Float64Value 1.0
 onePrimValue Bool = BoolValue True
 onePrimValue Unit = UnitValue
+
+withinBounds :: [(SubExp, VName)] -> TPrimExp Bool VName
+withinBounds [] = TPrimExp $ ValueExp (BoolValue True)
+withinBounds [(q, i)] = (le64 i .<. pe64 q) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i)
+withinBounds (qi : qis) = withinBounds [qi] .&&. withinBounds qis
 
 --
 -- special case of histogram with min/max as operator.
@@ -176,7 +182,6 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 --                             then nz_prd * pr_bar
 --                             else 0
 --                    ) is vs
-
 diffMulHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffMulHist _ops x aux n mul ne is vs w rf dst m = do
@@ -258,11 +263,44 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
           (eBody $ return $ 
             eIf 
               (eBinOp LogAnd (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 1) (eSubExp $ Var zr_cts)) 
-                            (eCmpOp (CmpEq t) (eSubExp $ Constant $ blankPrimValue t) $ eParam a_param))
+                             (eCmpOp (CmpEq t) (eSubExp $ Constant $ blankPrimValue t) $ eParam a_param))
               (eBody $ return $ eBinOp mul (eSubExp $ Var nz_prd) (eSubExp $ Var pr_bar)) 
               (eBody $ return $ eSubExp $ Constant $ blankPrimValue t) 
           )
   vs_bar <- 
     letExp "vs_bar" $ Op $ Screma n [is, vs] $ mapSOAC lam_vsbar
 
+  updateAdj vs vs_bar
+
+diffAddHist ::
+  VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
+diffAddHist _ops x aux n add ne is vs w rf dst m = do
+  let t = binOpType add
+
+  f <- mkIdentityLambda [Prim int64, Prim t]
+  add_lam <- binOpLambda add t
+  auxing aux $
+    letBindNames [x] $
+      Op $
+        Hist n [is, vs] [HistOp (Shape [w]) rf [dst] [ne] add_lam] f
+
+  m
+
+  x_bar <- lookupAdjVal x
+
+  updateAdj dst x_bar
+
+  ind_param <- newParam (baseString vs ++ "_ind") $ Prim t
+  lam_vsbar <- 
+      mkLambda [ind_param] $
+        fmap varsRes . letTupExp "vs_bar" =<<
+          eIf 
+            (toExp $ withinBounds $ return (w, paramName ind_param))
+            ( do
+                r <- letSubExp "r" $ BasicOp $ Index x_bar $ Slice [DimFix $ Var $ paramName ind_param]
+                resultBodyM [r]
+            )
+            (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
+
+  vs_bar <- letExp (baseString vs ++ "_bar") $ Op $ Screma n [is] $ mapSOAC lam_vsbar
   updateAdj vs vs_bar
