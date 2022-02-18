@@ -46,6 +46,16 @@ withinBounds [] = TPrimExp $ ValueExp (BoolValue True)
 withinBounds [(q, i)] = (le64 i .<. pe64 q) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i)
 withinBounds (qi : qis) = withinBounds [qi] .&&. withinBounds qis
 
+elseIf :: PrimType -> [(Builder SOACS Exp, Builder SOACS Exp)] -> [Builder SOACS Body] -> Builder SOACS Exp
+elseIf t [(c1,c2)] [bt,bf] =
+  eIf
+    (eCmpOp (CmpEq t) c1 c2) bt bf
+elseIf t ((c1,c2):cs) (bt:bs) =
+  eIf
+    (eCmpOp (CmpEq t) c1 c2) bt $
+      eBody $ return $ elseIf t cs bs
+elseIf _ _ _ = error "In elseIf, Hist.hs: input not supported"
+
 --
 -- special case of histogram with min/max as operator.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
@@ -345,28 +355,17 @@ radixSortStep xs tps shape bit n = do
         (eBinOp (Mul Int64 OverflowUndef)
           (iConst 2)
           (eBinOp (And Int64)
-            (eBinOp (AShr Int64) (eParam num_param) (eBinOp (Add Int64 OverflowUndef ) (eSubExp bit) (iConst 1)))
+            (eBinOp (AShr Int64) (eParam num_param) (eBinOp (Add Int64 OverflowUndef) (eSubExp bit) (iConst 1)))
             (iConst 1)
           )
         )
 
   bins <- letExp "bins" $ Op $ Screma n [is] $ mapSOAC num_lam
-
   flag_param <- newParam "flag" $ Prim int64
   flag_lam <- mkLambda [flag_param] $
     fmap varsRes . letTupExp "flag_res" =<<
-      eIf
-        (eCmpOp (CmpEq int64) (eParam flag_param) (iConst 0))
-        (eBody $ fmap iConst [1,0,0,0])
-        (eBody $ return $ eIf
-          (eCmpOp (CmpEq int64) (eParam flag_param) (iConst 1))
-          (eBody $ fmap iConst [0,1,0,0])
-          (eBody $ return $ eIf
-            (eCmpOp (CmpEq int64) (eParam flag_param) (iConst 2))
-            (eBody $ fmap iConst [0,0,1,0])
-            (eBody $ fmap iConst [0,0,0,1])
-          )
-        )
+      elseIf int64 (map ((,) (eParam flag_param) . iConst) [0..2])
+        (map (eBody . fmap iConst . (\i -> map (\j -> if i == j then 1 else 0) [0..3])) ([0..3] :: [Integer]))
 
   flags <- letTupExp "flags" $ Op $ Screma n [bins] $ mapSOAC flag_lam
 
@@ -381,41 +380,19 @@ radixSortStep xs tps shape bit n = do
   ind <- letSubExp "ind_last" =<< eBinOp (Sub Int64 OverflowUndef) (eSubExp n) (iConst 1)
   let i = Slice [DimFix ind]
   nabcd <- traverse newVName ["na","nb","nc","nd"]
-  let [na,nb,nc,_nd] = nabcd
   zipWithM_ (\abcd -> letBindNames [abcd] . BasicOp . flip Index i) nabcd offsets
 
+  let vars = map Var nabcd
   map_params <- traverse (flip newParam $ Prim int64) ["bin","a","b","c","d"]
-  let [bin,a_param,b_param,c_param,d_param] = map_params
   map_lam <- mkLambda map_params $
     fmap varsRes . letTupExp "map_res" =<<
-      eIf
-        (eCmpOp (CmpEq int64) (eParam bin) (iConst 0))
-        (eBody $ return $ eBinOp (Sub Int64 OverflowUndef) (eParam a_param) (iConst 1))
-        (eBody $ return $ eIf
-          (eCmpOp (CmpEq int64) (eParam bin) (iConst 1))
-          (eBody $ return $
-            eBinOp (Add Int64 OverflowUndef)
-            (eSubExp $ Var na)
-            (eBinOp (Sub Int64 OverflowUndef) (eParam b_param) (iConst 1))
-          )
-          (eBody $ return $ eIf
-            (eCmpOp (CmpEq int64) (eParam bin) (iConst 2))
-            (eBody $ return $
-              eBinOp (Add Int64 OverflowUndef)
-              (eSubExp $ Var na)
-              (eBinOp (Add Int64 OverflowUndef)
-                (eSubExp $ Var nb)
-                (eBinOp (Sub Int64 OverflowUndef) (eParam c_param) (iConst 1))))
-            (eBody $ return $
-              eBinOp (Add Int64 OverflowUndef)
-              (eSubExp $ Var na)
-              (eBinOp (Add Int64 OverflowUndef)
-                (eSubExp $ Var nb)
-                (eBinOp (Add Int64 OverflowUndef)
-                  (eSubExp $ Var nc)
-                  (eBinOp (Sub Int64 OverflowUndef) (eParam d_param) (iConst 1)))))
-          )
-        )
+      elseIf int64 (map ((,) (eParam $ head map_params) . iConst) [0..2]) (
+        zipWith (\j p ->
+          eBody $ return $ do
+            t <- letSubExp "t" =<< eBinOp (Sub Int64 OverflowUndef) (eParam p) (iConst 1)
+            foldBinOp (Add Int64 OverflowUndef) (Constant $ blankPrimValue int64) (t : take j vars)
+          ) 
+          [0..3] (tail map_params))
 
   nis <- letExp "nis" $ Op $ Screma n (bins : offsets) $ mapSOAC map_lam
 
