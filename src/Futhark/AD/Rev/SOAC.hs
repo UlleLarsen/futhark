@@ -117,5 +117,9 @@ vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
     Just [(op, _, _, _)] <- lamIsBinOp lam,
     isAddOp op =
     diffAddHist ops x aux n op ne is vs w rf dst m
+vjpSOAC ops pat aux soac@(Hist n as [histop] f) m 
+  | isIdentityLambda f = do
+    void $ commonSOAC pat aux soac m
+    diffHist ops (patNames pat) n as (lambdaReturnType f) histop
 vjpSOAC _ _ _ soac _ =
   error $ "vjpSOAC unhandled:\n" ++ pretty soac
