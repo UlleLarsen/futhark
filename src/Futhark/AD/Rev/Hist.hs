@@ -357,8 +357,8 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 --                         case _ -> na+nb+nc+d-1
 --   let is = map2 f bins offsets
 --   in scatter (copy xs) is xs
-radixSortStep :: [VName] -> [Type] -> Shape -> SubExp -> SubExp -> Builder SOACS Exp
-radixSortStep xs tps shape bit n = do
+radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> Builder SOACS Exp
+radixSortStep xs tps bit n = do
   let is = head xs
 
   num_param <- newParam "num" $ Prim int64
@@ -416,14 +416,14 @@ radixSortStep xs tps shape bit n = do
   xsclone <- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) xs
 
   ind_param <- newParam "ind_param" $ Prim int64
-  scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) tps
+  scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType tps
   scatter_lam <- mkLambda (ind_param : scatter_params) $
     fmap subExpsRes . letSubExps "scatter_map_res" =<< do
       p1 <- replicateM (length scatter_params) $ eParam ind_param
       p2 <- traverse eParam scatter_params
       return $ p1 ++ p2
 
-  return $ Op $ Scatter n (nis : xs) scatter_lam $ map ((,,) shape 1) xsclone
+  return $ Op $ Scatter n (nis : xs) scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) tps xsclone
   where
     iConst c = eSubExp $ intConst Int64 c
 
@@ -432,8 +432,8 @@ radixSortStep xs tps shape bit n = do
 -- def radix_sort [n] 't (xs: [n]i64) =
 --   let iters = if n == 0 then 0 else 32
 --   in loop xs for i < iters do radix_sort_step xs i64.get_bit (i*2)
-radixSort :: [VName] -> Shape -> SubExp -> ADM [VName]
-radixSort xs shape n = do
+radixSort :: [VName] -> SubExp -> ADM [VName]
+radixSort xs n = do
   iters <- letSubExp "iters" =<<
     eIf
       (eCmpOp (CmpEq int64) (eSubExp n) (eSubExp $ Constant $ blankPrimValue int64))
@@ -446,7 +446,7 @@ radixSort xs shape n = do
   loopbody <- runBodyBuilder . localScope (scopeOfFParams params) $ eBody $ return $ do
     bit <- letSubExp "bit" =<<
       eBinOp (Mul Int64 OverflowUndef) (eSubExp $ Var i) (eSubExp $ intConst Int64 2)
-    radixSortStep (map paramName params) (map rowType types) shape bit n
+    radixSortStep (map paramName params) types bit n
 
   letTupExp "sorted" $
     DoLoop
@@ -454,10 +454,30 @@ radixSort xs shape n = do
       (ForLoop i Int64 iters [])
       loopbody
 
+radixSort' :: [VName] -> SubExp -> ADM [VName]
+radixSort' xs n =
+  if length xs == 2 then
+    radixSort xs n
+  else do
+    iota_n <-
+      letExp "red_iota" $
+        BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
+
+    radres <- radixSort [head xs, iota_n] n
+
+    i_param <- newParam "i" $ Prim int64
+    let slice = Slice [DimFix $ Var $ paramName i_param]
+    map_lam <- mkLambda [i_param] $
+      fmap subExpsRes . letSubExps "sorted" $ 
+        map (BasicOp . flip Index slice) $ tail xs
+
+    sorted <- letTupExp "sorted" $ Op $ Screma n (tail radres) $ mapSOAC map_lam
+    return $ head radres : sorted
+
 diffHist :: VjpOps -> [VName] -> SubExp -> [VName] -> HistOp SOACS -> ADM ()
 --diffAd _ops x aux n add ne is vs w rf dst m 
 diffHist _ops xs n as op = do
-  sorted <- radixSort as (histShape op) n
+  sorted <- radixSort' as n
   zipWithM_ insAdj (tail as) (tail sorted)
 
   --error $ "todo\n" ++ show as ++ "\n" ++ show pat_adj ++ "\n" ++ show (histDest op)
