@@ -199,7 +199,6 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   let t = binOpType mul
 
   v_param <- newParam "v" $ Prim t
-
   map_lam <-
     mkLambda [v_param] $
       fmap varsRes . letTupExp "map_res" =<<
@@ -210,7 +209,6 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
 
   ps <- newVName "ps"
   zs <- newVName "zs"
-
   letBindNames [ps, zs] $
     Op $ Screma n [vs] $ mapSOAC map_lam
 
@@ -279,7 +277,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
               (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
           )
   vs_bar <-
-    letExp "vs_bar" $ Op $ Screma n [is, vs] $ mapSOAC lam_vsbar
+    letExp (baseString vs ++ "_bar") $ Op $ Screma n [is, vs] $ mapSOAC lam_vsbar
 
   updateAdj vs vs_bar
 
@@ -307,10 +305,7 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
         fmap varsRes . letTupExp "vs_bar" =<<
           eIf
             (toExp $ withinBounds $ return (w, paramName ind_param))
-            ( do
-                r <- letSubExp "r" $ BasicOp $ Index x_bar $ Slice [DimFix $ Var $ paramName ind_param]
-                resultBodyM [r]
-            )
+            (eBody $ return $ return $ BasicOp $ Index x_bar $ Slice [DimFix $ Var $ paramName ind_param])
             (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
 
   vs_bar <- letExp (baseString vs ++ "_bar") $ Op $ Screma n [is] $ mapSOAC lam_vsbar
