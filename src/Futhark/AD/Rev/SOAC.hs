@@ -120,6 +120,6 @@ vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
 vjpSOAC ops pat aux soac@(Hist n as [histop] f) m 
   | isIdentityLambda f = do
     void $ commonSOAC pat aux soac m
-    diffHist ops (patNames pat) n as (lambdaReturnType f) histop
+    diffHist ops (patNames pat) n as histop
 vjpSOAC _ _ _ soac _ =
   error $ "vjpSOAC unhandled:\n" ++ pretty soac
