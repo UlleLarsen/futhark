@@ -50,8 +50,11 @@ withinBounds (qi : qis) = withinBounds [qi] .&&. withinBounds qis
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
 --     let x = reduce_by_index dst minmax ne is vs
 -- Forward trace:
+--     need to copy dst: reverse trace might use it 7
+--       (see ex. in reducebyindexminmax6.fut where the first map requires the original dst to be differentiated). 
+--     let dst_cpy = copy dst
 --     let (x, x_inds) = zip vs (iota n)
---                       |> reduce_by_index dst argminmax (ne,-1) is
+--                       |> reduce_by_index dst_cpy argminmax (ne,-1) is
 --
 -- Reverse trace:
 --     dst_bar += map (\x_ind b -> if x_ind == -1 
@@ -68,6 +71,8 @@ diffMinMaxHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   let t = binOpType minmax
+  
+  dst_cpy <- letExp (baseString dst ++ "_copy") $ BasicOp $ Copy dst
 
   acc_v_p <- newParam "acc_v" $ Prim t
   acc_i_p <- newParam "acc_i" $ Prim int64
@@ -102,7 +107,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
     letExp "red_iota" $
       BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
   
-  let hist_op = HistOp (Shape [w]) rf [dst, minus_ones] [ne, intConst Int64 (-1)] hist_lam
+  let hist_op = HistOp (Shape [w]) rf [dst_cpy, minus_ones] [ne, intConst Int64 (-1)] hist_lam
   f' <- mkIdentityLambda [Prim int64, Prim t, Prim int64]
   x_inds <- newVName (baseString x <> "_inds")
   auxing aux $ 
@@ -162,6 +167,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
 --     let x = reduce_by_index dst (*) ne is vs
 -- Forward trace:
+--     dst does not need to be copied: dst is not overwritten
 --     let (ps, zs) = map (\v -> if x == 0 then (1,1) else (v,0)) vs
 --     let non_zero_prod = reduce_by_index nes (*) ne is ps
 --     let zero_count = reduce_by_index 0s (+) 0 is zs
@@ -232,7 +238,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   lam_mul' <- renameLambda lam_mul
   auxing aux $
     letBindNames [x]
-      $ Op $ Screma w [dst, h_part] $ mapSOAC lam_mul'
+      $ Op $ Screma w [dst, h_part] $ mapSOAC lam_mul' 
 
   m
 
@@ -272,17 +278,33 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
 
   updateAdj vs vs_bar
 
+--
+-- special case of histogram with add as operator.
+-- Original, assuming `is: [n]i64` and `dst: [w]btp`
+--     let x = reduce_by_index dst (+) ne is vs
+-- Forward trace:
+--     need to copy dst: reverse trace might use it 7
+--       (see ex. in reducebyindexminmax6.fut where the first map requires the original dst to be differentiated). 
+--     let dst_cpy = copy dst
+--     let x = reduce_by_index dst_cpy (+) ne is vs
+--
+-- Reverse trace:
+--     dst_bar += x_bar
+--
+--     vs_bar += map (\ i -> x_bar[i]) is
 diffAddHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffAddHist _ops x aux n add ne is vs w rf dst m = do
   let t = binOpType add
+
+  dst_cpy <- letExp (baseString dst ++ "_copy") $ BasicOp $ Copy dst
 
   f <- mkIdentityLambda [Prim int64, Prim t]
   add_lam <- binOpLambda add t
   auxing aux $
     letBindNames [x] $
       Op $
-        Hist n [is, vs] [HistOp (Shape [w]) rf [dst] [ne] add_lam] f
+        Hist n [is, vs] [HistOp (Shape [w]) rf [dst_cpy] [ne] add_lam] f
 
   m
 
@@ -290,7 +312,7 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 
   updateAdj dst x_bar
 
-  ind_param <- newParam (baseString vs ++ "_ind") $ Prim t
+  ind_param <- newParam (baseString vs ++ "_ind") $ Prim int64 
   lam_vsbar <- 
       mkLambda [ind_param] $
         fmap varsRes . letTupExp "vs_bar" =<<
