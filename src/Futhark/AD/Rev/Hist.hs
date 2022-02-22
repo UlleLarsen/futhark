@@ -12,13 +12,13 @@ module Futhark.AD.Rev.Hist
   )
 where
 
+import Control.Monad
 import Futhark.AD.Rev.Monad
 import Futhark.Analysis.PrimExp.Convert
 import Futhark.Builder
 import Futhark.IR.SOACS
 import Futhark.Tools
 import Futhark.Transform.Rename
-import Control.Monad
 
 getBinOpPlus :: PrimType -> BinOp
 getBinOpPlus (IntType x) = Add x OverflowUndef
@@ -82,7 +82,7 @@ diffMinMaxHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   let t = binOpType minmax
-  
+
   dst_cpy <- letExp (baseString dst ++ "_copy") $ BasicOp $ Copy dst
 
   acc_v_p <- newParam "acc_v" $ Prim t
@@ -117,7 +117,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   iota_n <-
     letExp "red_iota" $
       BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
-  
+
   let hist_op = HistOp (Shape [w]) rf [dst_cpy, minus_ones] [ne, intConst Int64 (-1)] hist_lam
   f' <- mkIdentityLambda [Prim int64, Prim t, Prim int64]
   x_inds <- newVName (baseString x <> "_inds")
@@ -247,7 +247,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   lam_mul' <- renameLambda lam_mul
   auxing aux $
     letBindNames [x]
-      $ Op $ Screma w [dst, h_part] $ mapSOAC lam_mul' 
+      $ Op $ Screma w [dst, h_part] $ mapSOAC lam_mul'
 
   m
 
@@ -321,8 +321,8 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 
   updateAdj dst x_bar
 
-  ind_param <- newParam (baseString vs ++ "_ind") $ Prim int64 
-  lam_vsbar <- 
+  ind_param <- newParam (baseString vs ++ "_ind") $ Prim int64
+  lam_vsbar <-
       mkLambda [ind_param] $
         fmap varsRes . letTupExp "vs_bar" =<<
           eIf
@@ -408,7 +408,7 @@ radixSortStep xs tps bit n = do
           eBody $ return $ do
             t <- letSubExp "t" =<< eBinOp (Sub Int64 OverflowUndef) (eParam p) (iConst 1)
             foldBinOp (Add Int64 OverflowUndef) (Constant $ blankPrimValue int64) (t : take j vars)
-          ) 
+          )
           [0..3] (tail map_params))
 
   nis <- letExp "nis" $ Op $ Screma n (bins : offsets) $ mapSOAC map_lam
@@ -465,11 +465,12 @@ radixSort' xs n =
 
     radres <- radixSort [head xs, iota_n] n
 
+    types <- traverse lookupType xs
     i_param <- newParam "i" $ Prim int64
-    let slice = Slice [DimFix $ Var $ paramName i_param]
+    let slice = [DimFix $ Var $ paramName i_param]
     map_lam <- mkLambda [i_param] $
-      fmap subExpsRes . letSubExps "sorted" $ 
-        map (BasicOp . flip Index slice) $ tail xs
+      fmap subExpsRes . letSubExps "sorted" $
+        zipWith (\t -> BasicOp . flip Index (fullSlice t slice)) (tail types) (tail xs)
 
     sorted <- letTupExp "sorted" $ Op $ Screma n (tail radres) $ mapSOAC map_lam
     return $ head radres : sorted
@@ -477,7 +478,143 @@ radixSort' xs n =
 diffHist :: VjpOps -> [VName] -> SubExp -> [VName] -> HistOp SOACS -> ADM ()
 --diffAd _ops x aux n add ne is vs w rf dst m 
 diffHist _ops xs n as op = do
+  let (lam0, nes) = (histOp op, histNeutral op)
+  lam <- renameLambda lam0
+  lam' <- renameLambda lam0 {lambdaParams = flipParams $ lambdaParams lam0}
+
   sorted <- radixSort' as n
-  zipWithM_ insAdj (tail as) (tail sorted)
+  let is = head sorted
+
+  --map (\i -> if i == 0 then true else is[i] != is[i-1]) (iota n)
+  iota_n <-
+    letExp "red_iota" $
+      BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
+
+  iota_param <- newParam "i" $ Prim int64
+  flag_lam <-
+    mkLambda [iota_param] $
+      fmap varsRes . letTupExp "flag" =<<
+        eIf
+          (eCmpOp (CmpEq int64) (eParam iota_param) (eSubExp $ Constant $ blankPrimValue int64))
+          (eBody $ return $ eSubExp $ Constant $ onePrimValue Bool)
+          (eBody $ return $ do
+            let vs_i = BasicOp $ Index is $ Slice $ return $ DimFix $ Var $ paramName iota_param
+            i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam iota_param) (eSubExp $ Constant $ onePrimValue int64)
+            let vs_p = BasicOp $ Index is $ Slice $ return $ DimFix $ Var i_p
+
+            t <- letSubExp "tmp" =<< eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
+            return $ BasicOp $ UnOp Not t
+          )
+
+  flag <- letExp "flag" $ Op $ Screma n [iota_n] $ mapSOAC flag_lam
+
+  par_i <- newParam "i" $ Prim int64
+
+  --map (\i -> (if flag[i] then 0 else vs[i-1], if i == 0 then 0 else if flag[n-i] then 0 else vs[n-i])) (iota n)
+  let i = paramName par_i
+  g_lam <- mkLambda [par_i] $
+    fmap subExpsRes . letSubExps "scan_inps" =<< do
+      im1 <- letSubExp "i_1" =<< toExp (le64 i - pe64 se1)
+      nmi <- letSubExp "n_i" =<< toExp (pe64 n - le64 i)
+      let s1 = [DimFix im1]
+      let s2 = [DimFix nmi]
+
+      f1 <- letSubExp "f1" $  BasicOp $ Index flag $ Slice [DimFix $ Var i]
+      f2 <- letSubExp "f1" $  BasicOp $ Index flag $ Slice [DimFix nmi]
+
+      r1 <- letTupExp' "r1" =<<
+        eIf
+          (eSubExp f1)
+          (eBody $ fmap eSubExp nes)
+          (eBody . fmap eSubExp =<< 
+            forM (tail sorted) (\x -> do
+              t <- lookupType x
+              letSubExp (baseString x ++ "_elem_1") $
+                BasicOp $ Index x $ fullSlice t s1
+            )
+          )
+
+      r2 <- letTupExp' "r2" =<<
+        eIf
+          (toExp $ le64 i .==. pe64 se0)
+          (eBody $ fmap eSubExp nes)
+          (eBody $ return $
+            eIf
+              (eSubExp f2)
+              (eBody $ fmap eSubExp nes)
+              (eBody . fmap eSubExp =<<
+                forM (tail sorted) (\x -> do
+                  t <- lookupType x
+                  letSubExp (baseString x ++ "_elem_2") $
+                    BasicOp $ Index x $ fullSlice t s2
+                )
+              )
+          )
+
+      traverse eSubExp $ f1 : r1 ++ f2 : r2
+
+  -- scan (\(v1,f1) (v2,f2) ->
+  --   let f = f1 || f2
+  --   let v = if f2 then v2 else g v1 v2
+  --   in (v,f) ) (ne,false) (zip vals flags)
+  scan_lams <- traverse (\l -> do
+    f1 <- newParam "f1" $ Prim Bool
+    f2 <- newParam "f2" $ Prim Bool
+    ps <- lambdaParams <$> renameLambda lam0
+    let (p1, p2) = splitAt (length nes) ps
+
+    mkLambda (f1 : p1 ++ f2 : p2) $
+      fmap varsRes . letTupExp "scan_res" =<<
+        let f = eBinOp LogOr (eParam f1) (eParam f2) in
+        eIf
+          (eParam f2)
+          (eBody $ f : fmap eParam p2)
+          (eBody . (f:) . fmap (eSubExp . resSubExp) =<< eLambda l (fmap eParam ps))) [lam, lam']
+
+  let nes' = Constant (BoolValue False) : nes
+
+  iota <- letExp "iota" $ BasicOp $ Iota n se0 se1 Int64
+  scansres <-
+    letTupExp "adj_ctrb_scan" $
+      Op $
+        Screma n [iota] $ ScremaForm (map (`Scan` nes') scan_lams) [] g_lam
+
+  let (_:ls_arr, _:rs_arr) = splitAt (length nes + 1) scansres
+
+
+
+  zipWithM_ insAdj (tail as) (drop 1 scansres)
+  where
+    flipParams ps = uncurry (flip (++)) $ splitAt (length ps `div` 2) ps
+    addFixIdx2FullSlice idx t =
+      let full_dims = unSlice $ fullSlice t []
+       in Slice $ DimFix idx : full_dims
+    se0 = intConst Int64 0
+    se1 = intConst Int64 1
+    mkFusedMapBody :: Param (TypeBase Shape NoUniqueness) -> [SubExp] -> [Type] -> ADM Body
+    mkFusedMapBody par_i ne alphas = do
+      let i = paramName par_i
+      runBodyBuilder . localScope (scopeOfLParams [par_i]) $
+        eBody
+          [ eIf
+              (toExp $ le64 i .>. pe64 se0)
+              ( do
+                  ((rs1, rs2), stms) <- runBuilderT' . localScope (scopeOfLParams [par_i]) $ do
+                    im1 <- letSubExp "i_1" =<< toExp (le64 i - pe64 se1)
+                    nmi <- letSubExp "n_i" =<< toExp (pe64 n - le64 i)
+                    tmp <- forM (zip as alphas) $ \(x, t) -> do
+                      x1 <-
+                        letSubExp (baseString x ++ "_elem_1") $
+                          BasicOp $ Index x $ addFixIdx2FullSlice im1 t
+                      x2 <-
+                        letSubExp (baseString x ++ "_elem_2") $
+                          BasicOp $ Index x $ addFixIdx2FullSlice nmi t
+                      return (x1, x2)
+                    return (unzip tmp)
+                  addStms stms
+                  resultBodyM (rs1 ++ rs2)
+              )
+              (resultBodyM (ne ++ ne))
+          ]
 
   --error $ "todo\n" ++ show as ++ "\n" ++ show pat_adj ++ "\n" ++ show (histDest op)
