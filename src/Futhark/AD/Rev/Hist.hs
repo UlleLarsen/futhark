@@ -56,6 +56,47 @@ elseIf t ((c1,c2):cs) (bt:bs) =
       eBody $ return $ elseIf t cs bs
 elseIf _ _ _ = error "In elseIf, Hist.hs: input not supported"
 
+-- \ls as rs ds -> map (\li ai ri di -> li `lam` ai `lam` ri `lam` di) ls as rs ds
+mkF :: Lambda -> [Type] -> SubExp -> ADM ([VName], Lambda)
+mkF lam tps n = do
+  lam_l <- renameLambda lam
+  lam_r <- renameLambda lam
+  lam_d <- renameLambda lam
+  let q = length $ lambdaReturnType lam
+      (lps, aps) = splitAt q $ lambdaParams lam_l
+      (ips, rps) = splitAt q $ lambdaParams lam_r
+      (jps, dps) = splitAt q $ lambdaParams lam_d
+  lam' <- mkLambda (lps <> aps <> rps <> dps) $ do
+    lam_l_res <- bodyBind $ lambdaBody lam_l
+    forM_ (zip ips lam_l_res) $ \(ip, SubExpRes cs se) ->
+      certifying cs $ letBindNames [paramName ip] $ BasicOp $ SubExp se
+    lam_r_res <- bodyBind $ lambdaBody lam_r
+    forM_ (zip jps lam_r_res) $ \(ip, SubExpRes cs se) ->
+      certifying cs $ letBindNames [paramName ip] $ BasicOp $ SubExp se
+    bodyBind $ lambdaBody lam_d
+
+  ls_params <- traverse (newParam "ls_param") tps
+  as_params <- traverse (newParam "as_param") tps
+  rs_params <- traverse (newParam "rs_param") tps
+  ds_params <- traverse (newParam "ds_param") tps
+  let map_params = ls_params <> as_params <> rs_params <> ds_params
+  lam_map <- mkLambda map_params $
+    fmap varsRes . letTupExp "map_f" $
+      Op $ Screma n (map paramName map_params) $ mapSOAC lam'
+
+  pure (map paramName as_params, lam_map)
+
+eReverse :: MonadBuilder m => VName -> m VName
+eReverse arr = do
+  arr_t <- lookupType arr
+  let w = arraySize 0 arr_t
+  start <-
+    letSubExp "rev_start" $
+      BasicOp $ BinOp (Sub Int64 OverflowUndef) w (intConst Int64 1)
+  let stride = intConst Int64 (-1)
+      slice = fullSlice arr_t [DimSlice start w stride]
+  letExp (baseString arr <> "_rev") $ BasicOp $ Index arr slice
+
 --
 -- special case of histogram with min/max as operator.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
@@ -455,35 +496,48 @@ radixSort xs n = do
       loopbody
 
 radixSort' :: [VName] -> SubExp -> ADM [VName]
-radixSort' xs n =
-  if length xs == 2 then
-    radixSort xs n
-  else do
-    iota_n <-
-      letExp "red_iota" $
-        BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
+radixSort' xs n = do
+  iota_n <-
+    letExp "red_iota" $
+      BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
 
-    radres <- radixSort [head xs, iota_n] n
+  radres <- radixSort [head xs, iota_n] n
+  let [is', iota'] = radres
 
-    types <- traverse lookupType xs
-    i_param <- newParam "i" $ Prim int64
-    let slice = [DimFix $ Var $ paramName i_param]
-    map_lam <- mkLambda [i_param] $
-      fmap subExpsRes . letSubExps "sorted" $
-        zipWith (\t -> BasicOp . flip Index (fullSlice t slice)) (tail types) (tail xs)
+  types <- traverse lookupType xs
+  i_param <- newParam "i" $ Prim int64
+  let slice = [DimFix $ Var $ paramName i_param]
+  map_lam <- mkLambda [i_param] $
+    fmap subExpsRes . letSubExps "sorted" $
+      zipWith (\t -> BasicOp . flip Index (fullSlice t slice)) (tail types) (tail xs)
 
-    sorted <- letTupExp "sorted" $ Op $ Screma n (tail radres) $ mapSOAC map_lam
-    return $ head radres : sorted
+  sorted <- letTupExp "sorted" $ Op $ Screma n (tail radres) $ mapSOAC map_lam
+  return $ iota' : is' : sorted
 
-diffHist :: VjpOps -> [VName] -> SubExp -> [VName] -> HistOp SOACS -> ADM ()
---diffAd _ops x aux n add ne is vs w rf dst m 
-diffHist _ops xs n as op = do
-  let (lam0, nes) = (histOp op, histNeutral op)
+diffHist :: VjpOps -> [VName] -> StmAux () ->  SubExp -> Lambda -> [SubExp] -> [VName] -> Shape -> SubExp -> [VName] -> ADM () -> ADM ()
+diffHist ops xs aux n lam0 nes as w rf dst m = do
+  as_type <- traverse lookupType $ tail as
+
+  dst_cpy <- traverse (\d -> letExp (baseString d ++ "_copy") $ BasicOp $ Copy d) dst
+
+  f <- mkIdentityLambda $ Prim int64 : map rowType as_type
+  auxing aux $
+    letBindNames xs $
+      Op $
+        Hist n as [HistOp w rf dst_cpy nes lam0] f
+
+  m
+
+  xs_bar <- traverse lookupAdjVal xs
+  --let (lam0, nes, dst) = (histOp op, histNeutral op, histDest op)
+
   lam <- renameLambda lam0
   lam' <- renameLambda lam0 {lambdaParams = flipParams $ lambdaParams lam0}
 
   sorted <- radixSort' as n
-  let is = head sorted
+  let siota = head sorted
+  let sis = head $ tail sorted
+  let sas = drop 2 sorted
 
   --map (\i -> if i == 0 then true else is[i] != is[i-1]) (iota n)
   iota_n <-
@@ -498,9 +552,9 @@ diffHist _ops xs n as op = do
           (eCmpOp (CmpEq int64) (eParam iota_param) (eSubExp $ Constant $ blankPrimValue int64))
           (eBody $ return $ eSubExp $ Constant $ onePrimValue Bool)
           (eBody $ return $ do
-            let vs_i = BasicOp $ Index is $ Slice $ return $ DimFix $ Var $ paramName iota_param
+            let vs_i = BasicOp $ Index sis $ Slice $ return $ DimFix $ Var $ paramName iota_param
             i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam iota_param) (eSubExp $ Constant $ onePrimValue int64)
-            let vs_p = BasicOp $ Index is $ Slice $ return $ DimFix $ Var i_p
+            let vs_p = BasicOp $ Index sis $ Slice $ return $ DimFix $ Var i_p
 
             t <- letSubExp "tmp" =<< eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
             return $ BasicOp $ UnOp Not t
@@ -510,7 +564,7 @@ diffHist _ops xs n as op = do
 
   par_i <- newParam "i" $ Prim int64
 
-  --map (\i -> (if flag[i] then 0 else vs[i-1], if i == 0 then 0 else if flag[n-i] then 0 else vs[n-i])) (iota n)
+  --map (\i -> (if flag[i] then 0 else vs[i-1], 2 then 0 else vs[n-i])) (iota n)
   let i = paramName par_i
   g_lam <- mkLambda [par_i] $
     fmap subExpsRes . letSubExps "scan_inps" =<< do
@@ -520,14 +574,14 @@ diffHist _ops xs n as op = do
       let s2 = [DimFix nmi]
 
       f1 <- letSubExp "f1" $  BasicOp $ Index flag $ Slice [DimFix $ Var i]
-      f2 <- letSubExp "f1" $  BasicOp $ Index flag $ Slice [DimFix nmi]
+      f2 <- letSubExp "f2" $  BasicOp $ Index flag $ Slice [DimFix nmi]
 
       r1 <- letTupExp' "r1" =<<
         eIf
           (eSubExp f1)
           (eBody $ fmap eSubExp nes)
-          (eBody . fmap eSubExp =<< 
-            forM (tail sorted) (\x -> do
+          (eBody . fmap eSubExp =<<
+            forM sas (\x -> do
               t <- lookupType x
               letSubExp (baseString x ++ "_elem_1") $
                 BasicOp $ Index x $ fullSlice t s1
@@ -543,7 +597,7 @@ diffHist _ops xs n as op = do
               (eSubExp f2)
               (eBody $ fmap eSubExp nes)
               (eBody . fmap eSubExp =<<
-                forM (tail sorted) (\x -> do
+                forM sas (\x -> do
                   t <- lookupType x
                   letSubExp (baseString x ++ "_elem_2") $
                     BasicOp $ Index x $ fullSlice t s2
@@ -569,6 +623,7 @@ diffHist _ops xs n as op = do
         eIf
           (eParam f2)
           (eBody $ f : fmap eParam p2)
+          -- might be wrong: certificates thrown away by resSubExp
           (eBody . (f:) . fmap (eSubExp . resSubExp) =<< eLambda l (fmap eParam ps))) [lam, lam']
 
   let nes' = Constant (BoolValue False) : nes
@@ -581,9 +636,39 @@ diffHist _ops xs n as op = do
 
   let (_:ls_arr, _:rs_arr) = splitAt (length nes + 1) scansres
 
+  par_i' <- newParam "i" $ Prim int64
+  map_lam <- mkLambda [par_i'] $
+    varsRes <$>
+      traverse (\x -> do
+        t <- lookupType x
+        letExp (baseString x) $
+          BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i']
+      ) (xs_bar ++ dst)
 
+  map_res <- letTupExp "stuff" $ Op $ Screma n [sis] $ mapSOAC map_lam
+  let (xs_bar', dst') = splitAt (length nes) map_res
 
-  zipWithM_ insAdj (tail as) (drop 1 scansres)
+  (as_params, f) <- mkF lam0 as_type n
+  f_adj <- vjpLambda ops (map adjFromVar xs_bar') as_params f
+
+  rev <- traverse eReverse rs_arr
+
+  r <- eLambda f_adj $ map (eSubExp . Var) $ ls_arr <> sas <> rev <> dst'
+
+  res <- traverse (\(SubExpRes cs se) -> letExp "hey" $ BasicOp $ SubExp se) r
+  resclone<- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) res
+
+  par_i'' <- newParam "i" $ Prim int64
+  scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType as_type
+  scatter_lam <- mkLambda (par_i'' : scatter_params) $
+    fmap subExpsRes . letSubExps "scatter_map_res" =<< do
+      p1 <- replicateM (length scatter_params) $ eParam par_i''
+      p2 <- traverse eParam scatter_params
+      return $ p1 ++ p2
+
+  adjs <- letTupExp "res" $ Op $ Scatter n (siota : res) scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type resclone
+
+  zipWithM_ insAdj (tail as) adjs
   where
     flipParams ps = uncurry (flip (++)) $ splitAt (length ps `div` 2) ps
     addFixIdx2FullSlice idx t =
@@ -591,30 +676,5 @@ diffHist _ops xs n as op = do
        in Slice $ DimFix idx : full_dims
     se0 = intConst Int64 0
     se1 = intConst Int64 1
-    mkFusedMapBody :: Param (TypeBase Shape NoUniqueness) -> [SubExp] -> [Type] -> ADM Body
-    mkFusedMapBody par_i ne alphas = do
-      let i = paramName par_i
-      runBodyBuilder . localScope (scopeOfLParams [par_i]) $
-        eBody
-          [ eIf
-              (toExp $ le64 i .>. pe64 se0)
-              ( do
-                  ((rs1, rs2), stms) <- runBuilderT' . localScope (scopeOfLParams [par_i]) $ do
-                    im1 <- letSubExp "i_1" =<< toExp (le64 i - pe64 se1)
-                    nmi <- letSubExp "n_i" =<< toExp (pe64 n - le64 i)
-                    tmp <- forM (zip as alphas) $ \(x, t) -> do
-                      x1 <-
-                        letSubExp (baseString x ++ "_elem_1") $
-                          BasicOp $ Index x $ addFixIdx2FullSlice im1 t
-                      x2 <-
-                        letSubExp (baseString x ++ "_elem_2") $
-                          BasicOp $ Index x $ addFixIdx2FullSlice nmi t
-                      return (x1, x2)
-                    return (unzip tmp)
-                  addStms stms
-                  resultBodyM (rs1 ++ rs2)
-              )
-              (resultBodyM (ne ++ ne))
-          ]
-
-  --error $ "todo\n" ++ show as ++ "\n" ++ show pat_adj ++ "\n" ++ show (histDest op)
+    mkIdxStm idx (t, r_arr, r) =
+      mkLet [Ident r t] $ BasicOp $ Index r_arr $ addFixIdx2FullSlice idx t
