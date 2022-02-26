@@ -56,6 +56,20 @@ elseIf t ((c1,c2):cs) (bt:bs) =
       eBody $ return $ elseIf t cs bs
 elseIf _ _ _ = error "In elseIf, Hist.hs: input not supported"
 
+-- \ds hs -> map2 lam ds hs
+mkF' :: Lambda -> [Type] -> SubExp -> ADM ([VName], Lambda)
+mkF' lam tps n = do
+  lam' <- renameLambda lam
+
+  ds_params <- traverse (newParam "ds_param") tps
+  hs_params <- traverse (newParam "hs_param") tps
+  let map_params = ds_params <> hs_params
+  lam_map <- mkLambda map_params $
+    fmap varsRes . letTupExp "map_f'" $
+      Op $ Screma n (map paramName map_params) $ mapSOAC lam'
+
+  pure (map paramName ds_params, lam_map)
+
 -- \ls as rs ds -> map (\li ai ri di -> li `lam` ai `lam` ri `lam` di) ls as rs ds
 mkF :: Lambda -> [Type] -> SubExp -> ADM ([VName], Lambda)
 mkF lam tps n = do
@@ -63,10 +77,10 @@ mkF lam tps n = do
   lam_r <- renameLambda lam
   lam_d <- renameLambda lam
   let q = length $ lambdaReturnType lam
-      (lps, aps) = splitAt q $ lambdaParams lam_l
-      (ips, rps) = splitAt q $ lambdaParams lam_r
-      (jps, dps) = splitAt q $ lambdaParams lam_d
-  lam' <- mkLambda (lps <> aps <> rps <> dps) $ do
+      (dps, lps) = splitAt q $ lambdaParams lam_l
+      (ips, aps) = splitAt q $ lambdaParams lam_r
+      (jps, rps) = splitAt q $ lambdaParams lam_d
+  lam' <- mkLambda (dps <> lps <> aps <> rps) $ do
     lam_l_res <- bodyBind $ lambdaBody lam_l
     forM_ (zip ips lam_l_res) $ \(ip, SubExpRes cs se) ->
       certifying cs $ letBindNames [paramName ip] $ BasicOp $ SubExp se
@@ -79,7 +93,7 @@ mkF lam tps n = do
   as_params <- traverse (newParam "as_param") tps
   rs_params <- traverse (newParam "rs_param") tps
   ds_params <- traverse (newParam "ds_param") tps
-  let map_params = ls_params <> as_params <> rs_params <> ds_params
+  let map_params = ds_params <> ls_params <> as_params <> rs_params
   lam_map <- mkLambda map_params $
     fmap varsRes . letTupExp "map_f" $
       Op $ Screma n (map paramName map_params) $ mapSOAC lam'
@@ -517,19 +531,35 @@ radixSort' xs n = do
 diffHist :: VjpOps -> [VName] -> StmAux () ->  SubExp -> Lambda -> [SubExp] -> [VName] -> Shape -> SubExp -> [VName] -> ADM () -> ADM ()
 diffHist ops xs aux n lam0 nes as w rf dst m = do
   as_type <- traverse lookupType $ tail as
+  dst_type <- traverse lookupType dst
 
-  dst_cpy <- traverse (\d -> letExp (baseString d ++ "_copy") $ BasicOp $ Copy d) dst
+  dst' <- traverse (letExp "dst_rep" . BasicOp . Replicate w) nes
 
   f <- mkIdentityLambda $ Prim int64 : map rowType as_type
+  h_part <- traverse (newVName . flip (++) "_h_part" . baseString) xs
+  auxing aux $
+    letBindNames h_part $
+      Op $
+        Hist n as [HistOp w rf dst' nes lam0] f
+
+  let Shape w' = w
+  lam0' <- renameLambda lam0
   auxing aux $
     letBindNames xs $
-      Op $
-        Hist n as [HistOp w rf dst_cpy nes lam0] f
+      Op $ Screma (head w') (dst ++ h_part) $ mapSOAC lam0'
 
   m
 
   xs_bar <- traverse lookupAdjVal xs
-  --let (lam0, nes, dst) = (histOp op, histNeutral op, histDest op)
+
+  (dst_params, f') <- mkF' lam0 dst_type $ head w'
+  f'_adj <- vjpLambda ops (map adjFromVar xs_bar) dst_params f'
+
+  r <- eLambda f'_adj $ map (eSubExp . Var) $ dst ++ h_part
+
+  -- wrong! ignores cs
+  dst_bar <- traverse (\(SubExpRes cs se) -> letExp "dst_bar" $ BasicOp $ SubExp se) r
+  zipWithM_ updateAdj dst dst_bar
 
   lam <- renameLambda lam0
   lam' <- renameLambda lam0 {lambdaParams = flipParams $ lambdaParams lam0}
@@ -653,7 +683,7 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
 
   rev <- traverse eReverse rs_arr
 
-  r <- eLambda f_adj $ map (eSubExp . Var) $ ls_arr <> sas <> rev <> dst'
+  r <- eLambda f_adj $ map (eSubExp . Var) $ dst' <> ls_arr <> sas <> rev
 
   res <- traverse (\(SubExpRes cs se) -> letExp "hey" $ BasicOp $ SubExp se) r
   resclone<- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) res
@@ -664,17 +694,12 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
     fmap subExpsRes . letSubExps "scatter_map_res" =<< do
       p1 <- replicateM (length scatter_params) $ eParam par_i''
       p2 <- traverse eParam scatter_params
-      return $ p1 ++ p2
+      return $ p1 <> p2
 
   adjs <- letTupExp "res" $ Op $ Scatter n (siota : res) scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type resclone
 
-  zipWithM_ insAdj (tail as) adjs
+  zipWithM_ updateAdj (tail as) adjs
   where
     flipParams ps = uncurry (flip (++)) $ splitAt (length ps `div` 2) ps
-    addFixIdx2FullSlice idx t =
-      let full_dims = unSlice $ fullSlice t []
-       in Slice $ DimFix idx : full_dims
     se0 = intConst Int64 0
     se1 = intConst Int64 1
-    mkIdxStm idx (t, r_arr, r) =
-      mkLet [Ident r t] $ BasicOp $ Index r_arr $ addFixIdx2FullSlice idx t
