@@ -568,10 +568,9 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   (dst_params, f') <- mkF' lam0 dst_type $ head w
   f'_adj <- vjpLambda ops (map adjFromVar xs_bar) dst_params f'
 
-  r <- eLambda f'_adj $ map (eSubExp . Var) $ dst ++ h_part
-
+  dst_bar' <- eLambda f'_adj $ map (eSubExp . Var) $ dst ++ h_part
   -- wrong! ignores cs
-  dst_bar <- traverse (\(SubExpRes cs se) -> letExp "dst_bar" $ BasicOp $ SubExp se) r
+  dst_bar <- traverse (\(SubExpRes cs se) -> letExp "dst_bar" $ BasicOp $ SubExp se) dst_bar'
   zipWithM_ updateAdj dst dst_bar
 
   lam <- renameLambda lam0
@@ -603,9 +602,8 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
 
   flag <- letExp "flag" $ Op $ Screma n [iota_n] $ mapSOAC flag_lam
 
+  -- map (\i -> (if flag[i] then 0 else vs[i-1], if i==0 || flag[n-i] then 0 else vs[n-i])) (iota n)
   par_i' <- newParam "i" $ Prim int64
-
-  --map (\i -> (if flag[i] then ne else vs[i-1], if flag[n-1] then ne else vs[n-i])) (iota n)
   let i = paramName par_i'
   g_lam <- mkLambda [par_i'] $
     fmap subExpsRes . letSubExps "scan_inps" =<< do
@@ -614,8 +612,8 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
       let s1 = [DimFix im1]
       let s2 = [DimFix nmi]
 
-      f1 <- letSubExp "f1" $  BasicOp $ Index flag $ Slice [DimFix $ Var i]
-      f2 <- letSubExp "f2" $  BasicOp $ Index flag $ Slice [DimFix nmi]
+      f1 <- letSubExp "f1" $ BasicOp $ Index flag $ Slice [DimFix $ Var i]
+      f2 <- letSubExp "f2" $ BasicOp $ Index flag $ Slice [DimFix nmi]
 
       r1 <- letTupExp' "r1" =<<
         eIf
@@ -703,10 +701,10 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
 
   rs_arr <- letTupExp "rs_arr" $ Op $ Screma n [iota_n] $ mapSOAC rev_lam
 
-  f_res <- eLambda f_adj $ map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr
+  sas_bar' <- eLambda f_adj $ map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr
 
-  as_bar' <- traverse (\(SubExpRes cs se) -> letExp "hey" $ BasicOp $ SubExp se) f_res
-  resclone <- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) as_bar'
+  sas_bar <- traverse (\(SubExpRes cs se) -> letExp "hey" $ BasicOp $ SubExp se) sas_bar'
+  sas_barclone <- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) sas_bar
 
   par_i'''' <- newParam "i" $ Prim int64
   scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType as_type
@@ -716,9 +714,11 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
       p2 <- traverse eParam scatter_params
       return $ p1 <> p2
 
-  adjs <- letTupExp "res" $ Op $ Scatter n (siota : as_bar') scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type resclone
+  as_bar <- letTupExp "res" $ 
+    Op $ Scatter n (siota : sas_bar) scatter_lam $ 
+      zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type sas_barclone
 
-  zipWithM_ updateAdj (tail as) adjs
+  zipWithM_ updateAdj (tail as) as_bar
   where
     flipParams ps = uncurry (flip (++)) $ splitAt (length ps `div` 2) ps
     se0 = intConst Int64 0
