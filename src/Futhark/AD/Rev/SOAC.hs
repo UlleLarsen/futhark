@@ -119,7 +119,7 @@ vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
     diffAddHist ops x aux n op ne is vs w rf dst m
 vjpSOAC ops pat aux (Hist n as [histop] f) m 
   | isIdentityLambda f,
-    HistOp w rf dst ne lam <- histop = do
+    HistOp (Shape w) rf dst ne lam <- histop = do
     diffHist ops (patNames pat) aux n lam ne as w rf dst m
 vjpSOAC _ _ _ soac _ =
   error $ "vjpSOAC unhandled:\n" ++ pretty soac

@@ -100,29 +100,18 @@ mkF lam tps n = do
 
   pure (map paramName as_params, lam_map)
 
-eReverse :: MonadBuilder m => VName -> m VName
-eReverse arr = do
-  arr_t <- lookupType arr
-  let w = arraySize 0 arr_t
-  start <-
-    letSubExp "rev_start" $
-      BasicOp $ BinOp (Sub Int64 OverflowUndef) w (intConst Int64 1)
-  let stride = intConst Int64 (-1)
-      slice = fullSlice arr_t [DimSlice start w stride]
-  letExp (baseString arr <> "_rev") $ BasicOp $ Index arr slice
-
 --
 -- special case of histogram with min/max as operator.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
 --     let x = reduce_by_index dst minmax ne is vs
--- Forward trace:
---     need to copy dst: reverse trace might use it 7
+-- Forward sweep:
+--     need to copy dst: reverse sweep might use it 7
 --       (see ex. in reducebyindexminmax6.fut where the first map requires the original dst to be differentiated). 
 --     let dst_cpy = copy dst
 --     let (x, x_inds) = zip vs (iota n)
 --                       |> reduce_by_index dst_cpy argminmax (ne,-1) is
 --
--- Reverse trace:
+-- Reverse sweep:
 --     dst_bar += map (\x_ind b -> if x_ind == -1 
 --                                 then b 
 --                                 else 0
@@ -232,7 +221,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 -- special case of histogram with multiplication as operator.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
 --     let x = reduce_by_index dst (*) ne is vs
--- Forward trace:
+-- Forward sweep:
 --     dst does not need to be copied: dst is not overwritten
 --     let (ps, zs) = map (\v -> if x == 0 then (1,1) else (v,0)) vs
 --     let non_zero_prod = reduce_by_index nes (*) ne is ps
@@ -241,7 +230,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 --                       ) non_zero_prod zero_count
 --     let x = map2 (*) dst h_part
 --
--- Reverse trace:
+-- Reverse sweep:
 --     dst_bar += map2 (*) h_part x_bar
 
 --     let part_bar = map2 (*) dst x_bar
@@ -346,13 +335,13 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
 -- special case of histogram with add as operator.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
 --     let x = reduce_by_index dst (+) ne is vs
--- Forward trace:
---     need to copy dst: reverse trace might use it 7
+-- Forward sweep:
+--     need to copy dst: reverse sweep might use it 7
 --       (see ex. in reducebyindexminmax6.fut where the first map requires the original dst to be differentiated). 
 --     let dst_cpy = copy dst
 --     let x = reduce_by_index dst_cpy (+) ne is vs
 --
--- Reverse trace:
+-- Reverse sweep:
 --     dst_bar += x_bar
 --
 --     vs_bar += map (\i -> x_bar[i]) is
@@ -528,31 +517,55 @@ radixSort' xs n = do
   sorted <- letTupExp "sorted" $ Op $ Screma n (tail radres) $ mapSOAC map_lam
   return $ iota' : is' : sorted
 
-diffHist :: VjpOps -> [VName] -> StmAux () ->  SubExp -> Lambda -> [SubExp] -> [VName] -> Shape -> SubExp -> [VName] -> ADM () -> ADM ()
-diffHist ops xs aux n lam0 nes as w rf dst m = do
+--
+-- generic case of histogram.
+-- Original, assuming `is: [n]i64` and `dst: [w]btp`
+--     let xs = reduce_by_index dst op ne is as
+-- Forward sweep:
+--     let nes = replicate w ne
+--     let h_part = reduce_by_index nes op ne is as
+--     let xs = map2 op dst h_part
+--
+-- Reverse sweep:
+--     dst_bar += f' dst h_part
+--
+--     let flag = map (\i -> if i == 0 then true else sis[i] != sis[i-1]) (iota n)
+--     let ls = seg_scan_exe op (false, ne) sas
+--     let rs = reverse (seg_scan_exe (\x y -> y `op` x) (reverse sas))
+--     let (f_bar, f_dst) = map (\i -> xs_bar[i], dst[i]) (iota n)
+--     let as_bar' = f f_dst ls as rs
+--     as_bar += scatter (copy vs_bar') siota as_bar'
+--
+-- Where:
+--     siota is 'iota n' sorted wrt is
+--     sis is 'is' sorted wrt is
+--     sas is 'as' sorted wrt is
+--     f' = vjpLambda xs_bar dst (\ds hs -> ds `op` hs)
+--     f  = vjpLambda f_bar as (\ls as rs ds -> map (\li ai ri di -> li `op` ai `op` ri `op` di) ls as rs ds)
+diffHist :: VjpOps -> [VName] -> StmAux () ->  SubExp -> Lambda -> [SubExp] -> [VName] -> [SubExp] -> SubExp -> [VName] -> ADM () -> ADM ()
+diffHist ops xs aux n lam0 ne as w rf dst m = do
   as_type <- traverse lookupType $ tail as
   dst_type <- traverse lookupType dst
 
-  dst' <- traverse (letExp "dst_rep" . BasicOp . Replicate w) nes
+  nes <- traverse (letExp "new_dst" . BasicOp . Replicate (Shape $ return $ head w)) ne
 
-  f <- mkIdentityLambda $ Prim int64 : map rowType as_type
+  h_map <- mkIdentityLambda $ Prim int64 : map rowType as_type
   h_part <- traverse (newVName . flip (++) "_h_part" . baseString) xs
   auxing aux $
     letBindNames h_part $
       Op $
-        Hist n as [HistOp w rf dst' nes lam0] f
+        Hist n as [HistOp (Shape w) rf nes ne lam0] h_map
 
-  let Shape w' = w
   lam0' <- renameLambda lam0
   auxing aux $
     letBindNames xs $
-      Op $ Screma (head w') (dst ++ h_part) $ mapSOAC lam0'
+      Op $ Screma (head w) (dst ++ h_part) $ mapSOAC lam0'
 
   m
 
   xs_bar <- traverse lookupAdjVal xs
 
-  (dst_params, f') <- mkF' lam0 dst_type $ head w'
+  (dst_params, f') <- mkF' lam0 dst_type $ head w
   f'_adj <- vjpLambda ops (map adjFromVar xs_bar) dst_params f'
 
   r <- eLambda f'_adj $ map (eSubExp . Var) $ dst ++ h_part
@@ -571,20 +584,18 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
 
   --map (\i -> if i == 0 then true else is[i] != is[i-1]) (iota n)
   iota_n <-
-    letExp "red_iota" $
-      BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
+    letExp "iota" $ BasicOp $ Iota n se0 se1 Int64
 
-  iota_param <- newParam "i" $ Prim int64
+  par_i <- newParam "i" $ Prim int64
   flag_lam <-
-    mkLambda [iota_param] $
+    mkLambda [par_i] $
       fmap varsRes . letTupExp "flag" =<<
         eIf
-          (eCmpOp (CmpEq int64) (eParam iota_param) (eSubExp $ Constant $ blankPrimValue int64))
+          (eCmpOp (CmpEq int64) (eParam par_i) (eSubExp $ Constant $ blankPrimValue int64))
           (eBody $ return $ eSubExp $ Constant $ onePrimValue Bool)
           (eBody $ return $ do
-            let vs_i = BasicOp $ Index sis $ Slice $ return $ DimFix $ Var $ paramName iota_param
-            i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam iota_param) (eSubExp $ Constant $ onePrimValue int64)
-            let vs_p = BasicOp $ Index sis $ Slice $ return $ DimFix $ Var i_p
+            i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam par_i) (eSubExp $ Constant $ onePrimValue int64)
+            let [vs_i, vs_p] = map (BasicOp . Index sis . Slice . return . DimFix . Var) [paramName par_i, i_p]
 
             t <- letSubExp "tmp" =<< eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
             return $ BasicOp $ UnOp Not t
@@ -592,11 +603,11 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
 
   flag <- letExp "flag" $ Op $ Screma n [iota_n] $ mapSOAC flag_lam
 
-  par_i <- newParam "i" $ Prim int64
+  par_i' <- newParam "i" $ Prim int64
 
-  --map (\i -> (if flag[i] then 0 else vs[i-1], 2 then 0 else vs[n-i])) (iota n)
-  let i = paramName par_i
-  g_lam <- mkLambda [par_i] $
+  --map (\i -> (if flag[i] then ne else vs[i-1], if flag[n-1] then ne else vs[n-i])) (iota n)
+  let i = paramName par_i'
+  g_lam <- mkLambda [par_i'] $
     fmap subExpsRes . letSubExps "scan_inps" =<< do
       im1 <- letSubExp "i_1" =<< toExp (le64 i - pe64 se1)
       nmi <- letSubExp "n_i" =<< toExp (pe64 n - le64 i)
@@ -609,7 +620,7 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
       r1 <- letTupExp' "r1" =<<
         eIf
           (eSubExp f1)
-          (eBody $ fmap eSubExp nes)
+          (eBody $ fmap eSubExp ne)
           (eBody . fmap eSubExp =<<
             forM sas (\x -> do
               t <- lookupType x
@@ -621,11 +632,11 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
       r2 <- letTupExp' "r2" =<<
         eIf
           (toExp $ le64 i .==. pe64 se0)
-          (eBody $ fmap eSubExp nes)
+          (eBody $ fmap eSubExp ne)
           (eBody $ return $
             eIf
               (eSubExp f2)
-              (eBody $ fmap eSubExp nes)
+              (eBody $ fmap eSubExp ne)
               (eBody . fmap eSubExp =<<
                 forM sas (\x -> do
                   t <- lookupType x
@@ -637,15 +648,15 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
 
       traverse eSubExp $ f1 : r1 ++ f2 : r2
 
-  -- scan (\(v1,f1) (v2,f2) ->
+  -- scan (\(f1,v1) (f2,v2) ->
   --   let f = f1 || f2
   --   let v = if f2 then v2 else g v1 v2
-  --   in (v,f) ) (ne,false) (zip vals flags)
+  --   in (f,v) ) (false,ne) (zip flags vals)
   scan_lams <- traverse (\l -> do
     f1 <- newParam "f1" $ Prim Bool
     f2 <- newParam "f2" $ Prim Bool
     ps <- lambdaParams <$> renameLambda lam0
-    let (p1, p2) = splitAt (length nes) ps
+    let (p1, p2) = splitAt (length ne) ps
 
     mkLambda (f1 : p1 ++ f2 : p2) $
       fmap varsRes . letTupExp "scan_res" =<<
@@ -656,47 +667,56 @@ diffHist ops xs aux n lam0 nes as w rf dst m = do
           -- might be wrong: certificates thrown away by resSubExp
           (eBody . (f:) . fmap (eSubExp . resSubExp) =<< eLambda l (fmap eParam ps))) [lam, lam']
 
-  let nes' = Constant (BoolValue False) : nes
+  let ne' = Constant (BoolValue False) : ne
 
-  iota <- letExp "iota" $ BasicOp $ Iota n se0 se1 Int64
   scansres <-
     letTupExp "adj_ctrb_scan" $
       Op $
-        Screma n [iota] $ ScremaForm (map (`Scan` nes') scan_lams) [] g_lam
+        Screma n [iota_n] $ ScremaForm (map (`Scan` ne') scan_lams) [] g_lam
 
-  let (_:ls_arr, _:rs_arr) = splitAt (length nes + 1) scansres
+  let (_:ls_arr, _:rs_arr_rev) = splitAt (length ne + 1) scansres
 
-  par_i' <- newParam "i" $ Prim int64
-  map_lam <- mkLambda [par_i'] $
+  par_i'' <- newParam "i" $ Prim int64
+  map_lam <- mkLambda [par_i''] $
     varsRes <$>
       traverse (\x -> do
         t <- lookupType x
         letExp (baseString x) $
-          BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i']
+          BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i'']
       ) (xs_bar ++ dst)
 
   map_res <- letTupExp "stuff" $ Op $ Screma n [sis] $ mapSOAC map_lam
-  let (xs_bar', dst') = splitAt (length nes) map_res
+  let (f_bar, f_dst) = splitAt (length ne) map_res
 
   (as_params, f) <- mkF lam0 as_type n
-  f_adj <- vjpLambda ops (map adjFromVar xs_bar') as_params f
+  f_adj <- vjpLambda ops (map adjFromVar f_bar) as_params f
 
-  rev <- traverse eReverse rs_arr
+  par_i''' <- newParam "i" $ Prim int64
+  rev_lam <- mkLambda [par_i'''] $
+    varsRes <$>
+      traverse (\x -> do
+        t <- lookupType x
+        nmim1 <- letSubExp "n_i_1" =<< toExp (pe64 n - le64 (paramName par_i''') - pe64 se1)
+        letExp (baseString x) $
+          BasicOp $ Index x $ fullSlice t [DimFix nmim1]
+      ) rs_arr_rev
 
-  r <- eLambda f_adj $ map (eSubExp . Var) $ dst' <> ls_arr <> sas <> rev
+  rs_arr <- letTupExp "rs_arr" $ Op $ Screma n [iota_n] $ mapSOAC rev_lam
 
-  res <- traverse (\(SubExpRes cs se) -> letExp "hey" $ BasicOp $ SubExp se) r
-  resclone<- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) res
+  f_res <- eLambda f_adj $ map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr
 
-  par_i'' <- newParam "i" $ Prim int64
+  as_bar' <- traverse (\(SubExpRes cs se) -> letExp "hey" $ BasicOp $ SubExp se) f_res
+  resclone <- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) as_bar'
+
+  par_i'''' <- newParam "i" $ Prim int64
   scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType as_type
-  scatter_lam <- mkLambda (par_i'' : scatter_params) $
+  scatter_lam <- mkLambda (par_i'''' : scatter_params) $
     fmap subExpsRes . letSubExps "scatter_map_res" =<< do
-      p1 <- replicateM (length scatter_params) $ eParam par_i''
+      p1 <- replicateM (length scatter_params) $ eParam par_i''''
       p2 <- traverse eParam scatter_params
       return $ p1 <> p2
 
-  adjs <- letTupExp "res" $ Op $ Scatter n (siota : res) scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type resclone
+  adjs <- letTupExp "res" $ Op $ Scatter n (siota : as_bar') scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type resclone
 
   zipWithM_ updateAdj (tail as) adjs
   where
