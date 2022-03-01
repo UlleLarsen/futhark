@@ -580,25 +580,12 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   let sis = head $ tail sorted
   let sas = drop 2 sorted
 
-  --map (\i -> if i == 0 then true else is[i] != is[i-1]) (iota n)
   iota_n <-
     letExp "iota" $ BasicOp $ Iota n se0 se1 Int64
 
+  --map (\i -> if i == 0 then true else is[i] != is[i-1]) (iota n)
   par_i <- newParam "i" $ Prim int64
-  flag_lam <-
-    mkLambda [par_i] $
-      fmap varsRes . letTupExp "flag" =<<
-        eIf
-          (eCmpOp (CmpEq int64) (eParam par_i) (eSubExp $ Constant $ blankPrimValue int64))
-          (eBody $ return $ eSubExp $ Constant $ onePrimValue Bool)
-          (eBody $ return $ do
-            i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam par_i) (eSubExp $ Constant $ onePrimValue int64)
-            let [vs_i, vs_p] = map (BasicOp . Index sis . Slice . return . DimFix . Var) [paramName par_i, i_p]
-
-            t <- letSubExp "tmp" =<< eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
-            return $ BasicOp $ UnOp Not t
-          )
-
+  flag_lam <- mkFlagLam par_i sis
   flag <- letExp "flag" $ Op $ Screma n [iota_n] $ mapSOAC flag_lam
 
   -- map (\i -> (if flag[i] then 0 else vs[i-1], if i==0 || flag[n-i] then 0 else vs[n-i])) (iota n)
@@ -674,30 +661,30 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
 
   let (_:ls_arr, _:rs_arr_rev) = splitAt (length ne + 1) scansres
 
+  -- map (\i -> xs_bar[i], dst[i]) (iota n)
   par_i'' <- newParam "i" $ Prim int64
   map_lam <- mkLambda [par_i''] $
     varsRes <$>
-      traverse (\x -> do
-        t <- lookupType x
+      zipWithM (\x t ->
         letExp (baseString x) $
           BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i'']
-      ) (xs_bar ++ dst)
+      ) (xs_bar ++ dst) (as_type ++ as_type)
 
-  map_res <- letTupExp "stuff" $ Op $ Screma n [sis] $ mapSOAC map_lam
-  let (f_bar, f_dst) = splitAt (length ne) map_res
+  f_bar_dst <- letTupExp "f_bar_dst" $ Op $ Screma n [sis] $ mapSOAC map_lam
+  let (f_bar, f_dst) = splitAt (length ne) f_bar_dst
 
   (as_params, f) <- mkF lam0 as_type n
   f_adj <- vjpLambda ops (map adjFromVar f_bar) as_params f
 
+  -- map (\i -> rs_arr_rev[n-i-1]) (iota n)
   par_i''' <- newParam "i" $ Prim int64
   rev_lam <- mkLambda [par_i'''] $
     varsRes <$>
-      traverse (\x -> do
-        t <- lookupType x
+      zipWithM (\x t -> do
         nmim1 <- letSubExp "n_i_1" =<< toExp (pe64 n - le64 (paramName par_i''') - pe64 se1)
         letExp (baseString x) $
           BasicOp $ Index x $ fullSlice t [DimFix nmim1]
-      ) rs_arr_rev
+      ) rs_arr_rev as_type
 
   rs_arr <- letTupExp "rs_arr" $ Op $ Screma n [iota_n] $ mapSOAC rev_lam
 
@@ -728,3 +715,17 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
                   bn <- newVName s
                   certifying cs $ letBindNames [bn] $ BasicOp $ SubExp se
                   return bn)
+    mkFlagLam :: LParam -> VName -> ADM Lambda
+    mkFlagLam par_i sis =     
+      mkLambda [par_i] $
+        fmap varsRes . letTupExp "flag" =<<
+          eIf
+            (eCmpOp (CmpEq int64) (eParam par_i) (eSubExp $ Constant $ blankPrimValue int64))
+            (eBody $ return $ eSubExp $ Constant $ onePrimValue Bool)
+            (eBody $ return $ do
+              i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam par_i) (eSubExp $ Constant $ onePrimValue int64)
+              let [vs_i, vs_p] = map (BasicOp . Index sis . Slice . return . DimFix . Var) [paramName par_i, i_p]
+
+              t <- letSubExp "tmp" =<< eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
+              return $ BasicOp $ UnOp Not t
+            )
