@@ -569,8 +569,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   f'_adj <- vjpLambda ops (map adjFromVar xs_bar) dst_params f'
 
   dst_bar' <- eLambda f'_adj $ map (eSubExp . Var) $ dst ++ h_part
-  -- wrong! ignores cs
-  dst_bar <- traverse (\(SubExpRes cs se) -> letExp "dst_bar" $ BasicOp $ SubExp se) dst_bar'
+  dst_bar <- bindSubExpRes "dst_bar" dst_bar'
   zipWithM_ updateAdj dst dst_bar
 
   lam <- renameLambda lam0
@@ -657,13 +656,14 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
     let (p1, p2) = splitAt (length ne) ps
 
     mkLambda (f1 : p1 ++ f2 : p2) $
-      fmap varsRes . letTupExp "scan_res" =<<
-        let f = eBinOp LogOr (eParam f1) (eParam f2) in
+      fmap varsRes . letTupExp "scan_res" =<< do
+        let f = eBinOp LogOr (eParam f1) (eParam f2)
         eIf
           (eParam f2)
           (eBody $ f : fmap eParam p2)
-          -- might be wrong: certificates thrown away by resSubExp
-          (eBody . (f:) . fmap (eSubExp . resSubExp) =<< eLambda l (fmap eParam ps))) [lam, lam']
+          (eBody . (f:) . fmap (eSubExp . Var) =<<
+            bindSubExpRes "gres" =<< eLambda l (fmap eParam ps))
+    ) [lam, lam']
 
   let ne' = Constant (BoolValue False) : ne
 
@@ -702,8 +702,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   rs_arr <- letTupExp "rs_arr" $ Op $ Screma n [iota_n] $ mapSOAC rev_lam
 
   sas_bar' <- eLambda f_adj $ map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr
-
-  sas_bar <- traverse (\(SubExpRes cs se) -> letExp "hey" $ BasicOp $ SubExp se) sas_bar'
+  sas_bar <- bindSubExpRes "sas_bar" sas_bar'
   sas_barclone <- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) sas_bar
 
   par_i'''' <- newParam "i" $ Prim int64
@@ -723,3 +722,9 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
     flipParams ps = uncurry (flip (++)) $ splitAt (length ps `div` 2) ps
     se0 = intConst Int64 0
     se1 = intConst Int64 1
+    bindSubExpRes :: String -> [SubExpRes] -> ADM [VName]
+    bindSubExpRes s = 
+      traverse (\(SubExpRes cs se) -> do
+                  bn <- newVName s
+                  certifying cs $ letBindNames [bn] $ BasicOp $ SubExp se
+                  return bn)
