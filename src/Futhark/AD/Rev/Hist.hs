@@ -112,10 +112,10 @@ mkF lam tps n = do
 --                       |> reduce_by_index dst_cpy argminmax (ne,-1) is
 --
 -- Reverse sweep:
---     dst_bar += map (\x_ind b -> if x_ind == -1 
---                                 then b 
---                                 else 0
---                    ) x_inds x_bar
+--     dst_bar += map2 (\i b -> if i == -1 
+--                              then b 
+--                              else 0
+--                     ) x_inds x_bar
 
 --     vs_ctrbs = map2 (\i b -> if i == -1
 --                              then 0
@@ -176,7 +176,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   x_bar_dst <- newParam (baseString x ++ "_bar_param") $ Prim t
   dst_lam <-
     mkLambda [x_ind_dst, x_bar_dst] $
-      fmap varsRes . letTupExp "res"
+      fmap varsRes . letTupExp "dst_bar"
         =<< eIf
           (eCmpOp (CmpEq int64) (eParam x_ind_dst) (eSubExp $ intConst Int64 (-1)))
           (eBody $ return $ eParam x_bar_dst)
@@ -346,18 +346,17 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
 --
 --     vs_bar += map (\i -> x_bar[i]) is
 diffAddHist ::
-  VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
+  VjpOps -> VName -> StmAux () -> SubExp -> Lambda -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffAddHist _ops x aux n add ne is vs w rf dst m = do
-  let t = binOpType add
-
+  let t = paramDec $ head $ lambdaParams add
+   
   dst_cpy <- letExp (baseString dst ++ "_copy") $ BasicOp $ Copy dst
 
-  f <- mkIdentityLambda [Prim int64, Prim t]
-  add_lam <- binOpLambda add t
+  f <- mkIdentityLambda [Prim int64, t]
   auxing aux $
     letBindNames [x] $
       Op $
-        Hist n [is, vs] [HistOp (Shape [w]) rf [dst_cpy] [ne] add_lam] f
+        Hist n [is, vs] [HistOp (Shape [w]) rf [dst_cpy] [ne] add] f
 
   m
 
@@ -365,14 +364,15 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 
   updateAdj dst x_bar
 
+  x_type <- lookupType x
   ind_param <- newParam (baseString vs ++ "_ind") $ Prim int64
   lam_vsbar <-
       mkLambda [ind_param] $
         fmap varsRes . letTupExp "vs_bar" =<<
           eIf
             (toExp $ withinBounds $ return (w, paramName ind_param))
-            (eBody $ return $ return $ BasicOp $ Index x_bar $ Slice [DimFix $ Var $ paramName ind_param])
-            (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
+            (eBody $ return $ return $ BasicOp $ Index x_bar $ fullSlice x_type [DimFix $ Var $ paramName ind_param])
+            (eBody $ return $ eBlank t)
 
   vs_bar <- letExp (baseString vs ++ "_bar") $ Op $ Screma n [is] $ mapSOAC lam_vsbar
   updateAdj vs vs_bar
@@ -700,7 +700,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
       p2 <- traverse eParam scatter_params
       return $ p1 <> p2
 
-  as_bar <- letTupExp "res" $ 
+  as_bar <- letTupExp "as_bar" $ 
     Op $ Scatter n (siota : sas_bar) scatter_lam $ 
       zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type sas_barclone
 

@@ -56,13 +56,29 @@ isMinMaxOp _ = False
 
 isMulOp :: BinOp -> Bool
 isMulOp (Mul _ _)   = True
-isMulOp (FMul _)    = True 
+isMulOp (FMul _)    = True
 isMulOp _           = False
 
 isAddOp :: BinOp -> Bool
-isAddOp (Add _ _)   = True 
-isAddOp (FAdd _)    = True 
+isAddOp (Add _ _)   = True
+isAddOp (FAdd _)    = True
 isAddOp _           = False
+
+mapOp :: Lambda -> Maybe Lambda
+mapOp (Lambda [pa1, pa2] lam_body _)
+  | [SubExpRes cs r] <- bodyResult lam_body,
+    cs == mempty,
+    [map_stm] <- stmsToList (bodyStms lam_body),
+    (Let (Pat [pe]) _ (Op scrm)) <- map_stm,
+    (Screma _ [a1, a2] (ScremaForm [] [] map_lam)) <- scrm,
+    (a1 == paramName pa1 && a2 == paramName pa2) || (a1 == paramName pa2 && a2 == paramName pa1),
+    r == Var (patElemName pe) =
+    Just map_lam
+mapOp _ = Nothing
+
+nestedMapOp :: Lambda -> Lambda
+nestedMapOp lam =
+  maybe lam nestedMapOp (mapOp lam)
 
 vjpSOAC :: VjpOps -> Pat -> StmAux () -> SOAC SOACS -> ADM () -> ADM ()
 vjpSOAC ops pat aux soac@(Screma w as form) m
@@ -101,23 +117,24 @@ vjpSOAC ops pat aux (Scatter w lam ass written_info) m =
 vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
   | isIdentityLambda f,
     [x] <- patNames pat,
-    HistOp (Shape [w]) rf [dst] [ne] lam <- histop, 
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
     Just [(op, _, _, _)] <- lamIsBinOp lam,
     isMinMaxOp op =
     diffMinMaxHist ops x aux n op ne is vs w rf dst m
   | isIdentityLambda f,
     [x] <- patNames pat,
-    HistOp (Shape [w]) rf [dst] [ne] lam <- histop, 
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
     Just [(op, _, _, _)] <- lamIsBinOp lam,
     isMulOp op =
     diffMulHist ops x aux n op ne is vs w rf dst m
   | isIdentityLambda f,
     [x] <- patNames pat,
-    HistOp (Shape [w]) rf [dst] [ne] lam <- histop, 
-    Just [(op, _, _, _)] <- lamIsBinOp lam,
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
+    lam' <- nestedMapOp lam,
+    Just [(op, _, _, _)] <- lamIsBinOp lam',
     isAddOp op =
-    diffAddHist ops x aux n op ne is vs w rf dst m
-vjpSOAC ops pat aux (Hist n as [histop] f) m 
+    diffAddHist ops x aux n lam ne is vs w rf dst m
+vjpSOAC ops pat aux (Hist n as [histop] f) m
   | isIdentityLambda f,
     HistOp (Shape w) rf dst ne lam <- histop = do
     diffHist ops (patNames pat) aux n lam ne as w rf dst m
