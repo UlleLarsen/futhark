@@ -109,7 +109,7 @@ mkF lam tps n = do
 --       (see ex. in reducebyindexminmax6.fut where the first map requires the original dst to be differentiated). 
 --     let dst_cpy = copy dst
 --     let (x, x_inds) = zip vs (iota n)
---                       |> reduce_by_index dst_cpy argminmax (ne,-1) is
+--                       |> reduce_by_index (dst_cpy,-1s) argminmax (ne,-1) is
 --
 -- Reverse sweep:
 --     dst_bar += map2 (\i b -> if i == -1 
@@ -372,7 +372,7 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
           eIf
             (toExp $ withinBounds $ return (w, paramName ind_param))
             (eBody $ return $ return $ BasicOp $ Index x_bar $ fullSlice x_type [DimFix $ Var $ paramName ind_param])
-            (eBody $ return $ eBlank t)
+            (eBody $ return $ eSubExp ne)
 
   vs_bar <- letExp (baseString vs ++ "_bar") $ Op $ Screma n [is] $ mapSOAC lam_vsbar
   updateAdj vs vs_bar
@@ -400,7 +400,7 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 --                         case 2 -> na+nb+c-1
 --                         case _ -> na+nb+nc+d-1
 --   let is = map2 f bins offsets
---   in scatter (copy xs) is xs
+--   in scatter scratch is xs
 radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> Builder SOACS Exp
 radixSortStep xs tps bit n = do
   let is = head xs
@@ -457,8 +457,6 @@ radixSortStep xs tps bit n = do
 
   nis <- letExp "nis" $ Op $ Screma n (bins : offsets) $ mapSOAC map_lam
 
-  xsclone <- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) xs
-
   ind_param <- newParam "ind_param" $ Prim int64
   scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType tps
   scatter_lam <- mkLambda (ind_param : scatter_params) $
@@ -467,7 +465,8 @@ radixSortStep xs tps bit n = do
       p2 <- traverse eParam scatter_params
       return $ p1 ++ p2
 
-  return $ Op $ Scatter n (nis : xs) scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) tps xsclone
+  scatter_dst <- traverse (\t -> letExp "scatter_dst" $ BasicOp $ Scratch (elemType t) (arrayDims t)) tps
+  return $ Op $ Scatter n (nis : xs) scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) tps scatter_dst
   where
     iConst c = eSubExp $ intConst Int64 c
 
@@ -531,10 +530,10 @@ radixSort' xs n = do
 --
 --     let flag = map (\i -> if i == 0 then true else sis[i] != sis[i-1]) (iota n)
 --     let ls = seg_scan_exe op (false, ne) sas
---     let rs = reverse (seg_scan_exe (\x y -> y `op` x) (reverse sas))
---     let (f_bar, f_dst) = map (\i -> xs_bar[i], dst[i]) (iota n)
+--     let rs = reverse (seg_scan_exe op (reverse sas))
+--     let (f_bar, f_dst) = map (\i -> if i < w && -1 < w then (xs_bar[i], dst[i]) else (0,ne)) sis
 --     let as_bar' = f f_dst ls as rs
---     as_bar += scatter (copy vs_bar') siota as_bar'
+--     as_bar += scatter (Scratch) siota as_bar'
 --
 -- Where:
 --     siota is 'iota n' sorted wrt is
@@ -573,7 +572,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   zipWithM_ updateAdj dst dst_bar
 
   lam <- renameLambda lam0
-  lam' <- renameLambda lam0 {lambdaParams = flipParams $ lambdaParams lam0}
+  lam' <- renameLambda lam0
 
   sorted <- radixSort' as n
   let siota = head sorted
@@ -661,14 +660,22 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
 
   let (_:ls_arr, _:rs_arr_rev) = splitAt (length ne + 1) scansres
 
-  -- map (\i -> xs_bar[i], dst[i]) (iota n)
+  -- map (\i -> if i < w && -1 < w then (xs_bar[i], dst[i]) else (0,ne)) sis
   par_i'' <- newParam "i" $ Prim int64
+  let i'' = paramName par_i''
   map_lam <- mkLambda [par_i''] $
-    varsRes <$>
-      zipWithM (\x t ->
-        letExp (baseString x) $
-          BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i'']
-      ) (xs_bar ++ dst) (as_type ++ as_type)
+    fmap varsRes . letTupExp "scan_res" =<<
+      eIf 
+        (toExp $ (le64 i'' .<. pe64 (head w)) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i''))
+        (eBody $ do 
+          zipWith (\x t -> 
+            return $ BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i'']) (xs_bar ++ dst) (as_type ++ as_type)
+        )
+        (eBody $ do
+          let xs_bar_ne = map (\t -> return $ BasicOp $ Replicate (Shape $ tail $ arrayDims t) (Constant $ blankPrimValue $ elemType t)) as_type
+          let dst_ne = map eSubExp ne
+          xs_bar_ne ++ dst_ne
+        )
 
   f_bar_dst <- letTupExp "f_bar_dst" $ Op $ Screma n [sis] $ mapSOAC map_lam
   let (f_bar, f_dst) = splitAt (length ne) f_bar_dst
@@ -690,7 +697,6 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
 
   sas_bar' <- eLambda f_adj $ map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr
   sas_bar <- bindSubExpRes "sas_bar" sas_bar'
-  sas_barclone <- traverse (\x -> letExp (baseString x ++ "_copy") $ BasicOp $ Copy x) sas_bar
 
   par_i'''' <- newParam "i" $ Prim int64
   scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType as_type
@@ -700,13 +706,13 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
       p2 <- traverse eParam scatter_params
       return $ p1 <> p2
 
+  scatter_dst <- traverse (\t -> letExp "scatter_dst" $ BasicOp $ Scratch (elemType t) (arrayDims t)) as_type
   as_bar <- letTupExp "as_bar" $ 
     Op $ Scatter n (siota : sas_bar) scatter_lam $ 
-      zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type sas_barclone
+      zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type scatter_dst
 
   zipWithM_ updateAdj (tail as) as_bar
   where
-    flipParams ps = uncurry (flip (++)) $ splitAt (length ps `div` 2) ps
     se0 = intConst Int64 0
     se1 = intConst Int64 1
     bindSubExpRes :: String -> [SubExpRes] -> ADM [VName]
