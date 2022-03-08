@@ -56,6 +56,22 @@ elseIf t ((c1,c2):cs) (bt:bs) =
       eBody $ return $ elseIf t cs bs
 elseIf _ _ _ = error "In elseIf, Hist.hs: input not supported"
 
+bindSubExpRes :: String -> [SubExpRes] -> ADM [VName]
+bindSubExpRes s =
+  traverse (\(SubExpRes cs se) -> do
+              bn <- newVName s
+              certifying cs $ letBindNames [bn] $ BasicOp $ SubExp se
+              return bn)
+
+nestedmap :: [SubExp] -> [PrimType] -> Lambda -> ADM Lambda
+nestedmap [] _ lam = return lam
+nestedmap s@(h : r) pt lam = do
+    params <- traverse (\tp -> newParam "x" $ Array tp (Shape s) NoUniqueness) pt
+    body <- nestedmap r pt lam
+    mkLambda params $ 
+      fmap varsRes . letTupExp "res" $
+        Op $ Screma h (map paramName params) $ mapSOAC body
+
 -- \ds hs -> map2 lam ds hs
 mkF' :: Lambda -> [Type] -> SubExp -> ADM ([VName], Lambda)
 mkF' lam tps n = do
@@ -223,7 +239,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 --     let x = reduce_by_index dst (*) ne is vs
 -- Forward sweep:
 --     dst does not need to be copied: dst is not overwritten
---     let (ps, zs) = map (\v -> if x == 0 then (1,1) else (v,0)) vs
+--     let (ps, zs) = map (\v -> if v == 0 then (1,1) else (v,0)) vs
 --     let non_zero_prod = reduce_by_index nes (*) ne is ps
 --     let zero_count = reduce_by_index 0s (+) 0 is zs
 --     let h_part = map2 (\p c -> if c == 0 then p else 0
@@ -247,30 +263,37 @@ diffMulHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   let t = binOpType mul
+  vs_type <- lookupType vs
+  let vs_dims = arrayDims vs_type
+  let vs_elm_type = elemType vs_type
+  dst_type <- lookupType dst
+  let dst_dims = arrayDims dst_type
 
   v_param <- newParam "v" $ Prim t
-  map_lam <-
+  lam_ps_zs_inner <-
     mkLambda [v_param] $
       fmap varsRes . letTupExp "map_res" =<<
         eIf
           (eCmpOp (CmpEq t) (eParam  v_param) (eSubExp $ Constant $ blankPrimValue t))
           (eBody $ fmap eSubExp [Constant $ onePrimValue t, intConst Int64 1])
           (eBody [eParam v_param, eSubExp $ intConst Int64 0])
+  lam_ps_zs <- nestedmap vs_dims [vs_elm_type] lam_ps_zs_inner
+  ps_zs_res <- eLambda lam_ps_zs [eSubExp $ Var vs]
+  ps_zs <- bindSubExpRes "ps_zs" ps_zs_res
+  let [ps, zs] = ps_zs
 
-  ps <- newVName "ps"
-  zs <- newVName "zs"
-  letBindNames [ps, zs] $
-    Op $ Screma n [vs] $ mapSOAC map_lam
-
-  lam_mul <- binOpLambda mul t
+  lam_mul_inner <- binOpLambda mul t
+  lam_mul <- nestedmap (tail vs_dims) [vs_elm_type, vs_elm_type] lam_mul_inner
   nz_prods0 <- letExp "nz_prd" $ BasicOp $ Replicate (Shape [w]) ne
   let hist_nzp = HistOp (Shape [w]) rf [nz_prods0] [ne] lam_mul
 
-  lam_add <- binOpLambda (Add Int64 OverflowUndef) int64
-  zr_counts0 <- letExp "zr_cts" $ BasicOp $ Replicate (Shape [w]) (intConst Int64 0)
-  let hist_zrn = HistOp (Shape [w]) rf [zr_counts0] [intConst Int64 0] lam_add
+  lam_add_inner <- binOpLambda (Add Int64 OverflowUndef) int64
+  lam_add <- nestedmap (tail vs_dims) [int64, int64] lam_add_inner
+  zr_counts0 <- letExp "zr_cts" $ BasicOp $ Replicate (Shape dst_dims) (intConst Int64 0)
+  zrn_ne <- letExp "zr_ne" $ BasicOp $ Replicate (Shape $ tail vs_dims) (intConst Int64 0)
+  let hist_zrn = HistOp (Shape [w]) rf [zr_counts0] [if length vs_dims == 1 then intConst Int64 0 else Var zrn_ne] lam_add
 
-  f' <- mkIdentityLambda [Prim int64, Prim int64, Prim t, Prim int64]
+  f' <- mkIdentityLambda [Prim int64, Prim int64, rowType vs_type, rowType $ Array int64 (Shape vs_dims) NoUniqueness]
   nz_prods <- newVName "non_zero_prod"
   zr_counts <- newVName "zero_count"
   auxing aux $
@@ -278,33 +301,41 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
 
   p_param <- newParam "prod" $ Prim t
   c_param <- newParam "count" $ Prim int64
-  h_part_body <-
+  lam_h_part_inner <-
     mkLambda [p_param, c_param] $
       fmap varsRes . letTupExp "h_part" =<<
         eIf
           (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 0) (eParam c_param))
           (eBody $ return $ eParam p_param)
           (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
-  h_part <-
-    letExp "h_part" $ Op $ Screma w [nz_prods, zr_counts] $ mapSOAC h_part_body
+  lam_h_part <- nestedmap dst_dims [vs_elm_type, int64] lam_h_part_inner
+  h_part_res <- eLambda lam_h_part $ map (eSubExp . Var) [nz_prods, zr_counts]
+  h_part' <- bindSubExpRes "h_part" h_part_res
+  let [h_part] = h_part'
 
-  lam_mul' <- renameLambda lam_mul
+  lam_mul_inner' <- binOpLambda mul t
+  lam_mul' <- nestedmap dst_dims [vs_elm_type, vs_elm_type] lam_mul_inner'
+  x_res <- eLambda lam_mul' $ map (eSubExp . Var) [dst, h_part]
+  x' <- bindSubExpRes "x" x_res
   auxing aux $
-    letBindNames [x]
-      $ Op $ Screma w [dst, h_part] $ mapSOAC lam_mul'
+    letBindNames [x] $
+      BasicOp $ SubExp $ Var $ head x'
 
   m
 
   x_bar <- lookupAdjVal x
 
-  lam_mul'' <- renameLambda lam_mul
-  dst_bar <-
-    letExp (baseString dst ++ "_bar") $ Op $ Screma w [h_part, x_bar] $ mapSOAC lam_mul''
-  updateAdj dst dst_bar
+  lam_mul'' <- renameLambda lam_mul'
+  dst_bar_res <- eLambda lam_mul'' $ map (eSubExp . Var) [h_part, x_bar]
+  dst_bar <- bindSubExpRes (baseString dst ++ "_bar") dst_bar_res
+  updateAdj dst $ head dst_bar
 
-  lam_mul''' <- renameLambda lam_mul
-  part_bar <-
-    letExp "part_bar" $ Op $ Screma w [dst, x_bar] $ mapSOAC lam_mul'''
+  lam_mul''' <- renameLambda lam_mul'
+  part_bar_res <- eLambda lam_mul''' $ map (eSubExp . Var) [dst, x_bar]
+  part_bar' <- bindSubExpRes "part_bar" part_bar_res
+  let [part_bar] = part_bar'
+  -- part_bar <-
+  --   letExp "part_bar" $ Op $ Screma w [dst, x_bar] $ mapSOAC lam_mul'''
 
   j_param <- newParam "j" $ Prim int64
   a_param <- newParam "a" $ Prim t
@@ -349,7 +380,7 @@ diffAddHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> Lambda -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffAddHist _ops x aux n add ne is vs w rf dst m = do
   let t = paramDec $ head $ lambdaParams add
-   
+
   dst_cpy <- letExp (baseString dst ++ "_copy") $ BasicOp $ Copy dst
 
   f <- mkIdentityLambda [Prim int64, t]
@@ -529,8 +560,8 @@ radixSort' xs n = do
 --     dst_bar += f' dst h_part
 --
 --     let flag = map (\i -> if i == 0 then true else sis[i] != sis[i-1]) (iota n)
---     let ls = seg_scan_exe op (false, ne) sas
---     let rs = reverse (seg_scan_exe op (reverse sas))
+--     let ls = seg_scan_exe op (false, ne) (zip flag sas)
+--     let rs = reverse (seg_scan_exe op (false, ne) (reverse (zip flag sas)))
 --     let (f_bar, f_dst) = map (\i -> if i < w && -1 < w then (xs_bar[i], dst[i]) else (0,ne)) sis
 --     let as_bar' = f f_dst ls as rs
 --     as_bar += scatter (Scratch) siota as_bar'
@@ -665,10 +696,10 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   let i'' = paramName par_i''
   map_lam <- mkLambda [par_i''] $
     fmap varsRes . letTupExp "scan_res" =<<
-      eIf 
+      eIf
         (toExp $ (le64 i'' .<. pe64 (head w)) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i''))
-        (eBody $ do 
-          zipWith (\x t -> 
+        (eBody $ do
+          zipWith (\x t ->
             return $ BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i'']) (xs_bar ++ dst) (as_type ++ as_type)
         )
         (eBody $ do
@@ -707,22 +738,16 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
       return $ p1 <> p2
 
   scatter_dst <- traverse (\t -> letExp "scatter_dst" $ BasicOp $ Scratch (elemType t) (arrayDims t)) as_type
-  as_bar <- letTupExp "as_bar" $ 
-    Op $ Scatter n (siota : sas_bar) scatter_lam $ 
+  as_bar <- letTupExp "as_bar" $
+    Op $ Scatter n (siota : sas_bar) scatter_lam $
       zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type scatter_dst
 
   zipWithM_ updateAdj (tail as) as_bar
   where
     se0 = intConst Int64 0
     se1 = intConst Int64 1
-    bindSubExpRes :: String -> [SubExpRes] -> ADM [VName]
-    bindSubExpRes s = 
-      traverse (\(SubExpRes cs se) -> do
-                  bn <- newVName s
-                  certifying cs $ letBindNames [bn] $ BasicOp $ SubExp se
-                  return bn)
     mkFlagLam :: LParam -> VName -> ADM Lambda
-    mkFlagLam par_i sis =     
+    mkFlagLam par_i sis =
       mkLambda [par_i] $
         fmap varsRes . letTupExp "flag" =<<
           eIf
