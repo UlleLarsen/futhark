@@ -1,16 +1,20 @@
 -- ==
--- entry: rev
--- compiled input { [2f32,1f32,1f32,1f32,1f32] [0i64,0i64,0i64,0i64,0i64] [1f32,2f32,3f32,4f32,10f32] } output { [244f32,0f32,0f32,0f32,0f32] }
--- compiled input { [10f32,1f32,1f32,1f32,1f32] [0i64,0i64,0i64,0i64,0i64] [0f32,2f32,3f32,4f32,5f32] } output { [20f32,0f32,0f32,0f32,0f32] }
--- compiled input { [0f32,1f32,1f32,1f32,1f32] [0i64,0i64,0i64,0i64,0i64] [1f32,2f32,3f32,4f32,5f32] } output { [120f32,0f32,0f32,0f32,0f32] }
--- compiled input { [0f32,1f32,1f32,1f32,1f32] [0i64,0i64,0i64,0i64,0i64] [1f32,2f32,0f32,4f32,5f32] } output { [0f32,0f32,0f32,0f32,0f32] }
+--  entry: main
+--  compiled input {
+--    [0i64,0i64,0i64,1i64,1i64,1i64,1i64]
+--    [[[1f32,2f32],[0f32,4f32]],[[5f32,0f32],[9f32,0f32]]]
+--    [[[1f32,3f32],[6f32,0f32]],[[2f32,4f32],[7f32,9f32]],[[18f32,5f32],[19f32,20f32]],
+--     [[0f32,14f32],[1f32,1f32]],[[11f32,0f32],[1f32,1f32]],[[0f32,16f32],[1f32,1f32]],[[13f32,21f32],[1f32,1f32]]]
+--    [[[1f32,2f32],[3f32,4f32]],[[5f32,6f32],[7f32,8f32]]] }
+--  output {
+--    [[[36f32,120f32],[2394f32,0f32]],[[0f32,0f32],[7f32,8f32]]]
+--    [[[36f32,80f32],[0f32,2880f32]],[[18f32,60f32],[0f32,0f32]],[[2f32,48f32],[0f32,0f32]],
+--     [[0f32,0f32],[63f32,0f32]],[[0f32,0f32],[63f32,0f32]],[[0f32,0f32],[63f32,0f32]],[[0f32,0f32],[63f32,0f32]]]
+--    [[[36f32,120f32],[0f32,0f32]],[[0f32,0f32],[9f32,0f32]]] }
 
--- checks original dst is used
-def red_mul [n][m] (is: [n]i64) (vs: [n]f32) (dst: [m]f32) =
-  let dst2 = copy dst
-  let a = map (**2) dst2
-  let b = reduce_by_index dst2 (*) 1 is vs 
-  in map2 (+) a b
+def f [n][m][k][l] (is: [n]i64) (dst: [k][m][l]f32,vs: [n][m][l]f32,c: [k][m][l]f32) =
+  let tmp = reduce_by_index (copy dst) (map2 (map2 (*))) (replicate m (replicate l 1)) is vs
+  in map2 (map2 (map2 (*))) tmp c
 
-entry rev [n][m] (dst: [m]f32) (is: [n]i64) (vs: [n]f32) =
-  vjp (red_mul is vs) dst (replicate m 0 with [0] = 1)
+def main [n][m][k][l] (is: [n]i64) (dst: [k][m][l]f32) (vs: [n][m][l]f32) (c: [k][m][l]f32) =
+  vjp (f is) (dst,vs,c) (replicate k (replicate m (replicate l 1)))

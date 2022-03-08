@@ -1,12 +1,24 @@
+-- 0 zero - dst neutral / dst no neutral
+-- 1 zero - dst / vs
+-- 2 zero - both in vs / one in dst and one in vs
+-- bucket with no values - zero / not zero
+-- index out of bounds
+
 -- ==
--- entry: rev
--- compiled input { [0i64, 1i64, 2i64, 3i64, 4i64] [0.0f32, 1.0f32, 2.0f32, 3.0f32, 4.0f32] } output { [1f32,0f32,0f32,0f32,0f32] }
--- compiled input { [0i64, 0i64, 0i64, 0i64, 0i64] [0.0f32, 1.0f32, 2.0f32, 3.0f32, 4.0f32] } output { [24f32,0f32,0f32,0f32,0f32] }
--- compiled input { [0i64, 0i64, 0i64, 0i64, 0i64] [0.0f32, 1.0f32, 0.0f32, 3.0f32, 4.0f32] } output { [0f32,0f32,0f32,0f32,0f32] }
--- compiled input { [0i64, 0i64, 0i64, 0i64, 0i64] [1.0f32, 5.0f32, 2.0f32, 3.0f32, 4.0f32] } output { [120f32,24f32,60f32,40f32,30f32] }
+--  entry: main
+--  compiled input { 
+--    [4i64,5i64,2i64,4i64,5i64,2i64,0i64,0i64,4i64,5i64,1i64,4i64,1i64,3i64,3i64,1i64,8i64,-1i64]
+--    [1f32,2f32,0f32,4f32,5f32,0f32,9f32,0f32]
+--    [11f32,16f32,7f32,0f32,14f32,6f32,2f32,1f32,13f32,0f32,5f32,0f32,3f32,0f32,9f32,4f32,17f32,18f32] }
+--  output { 
+--    [2f32,60f32,42f32,0f32,0f32,0f32,1f32,1f32]
+--    [0f32,0f32,0f32,0f32,0f32,0f32,1f32,2f32,0f32,0f32,24f32,0f32,40f32,36f32,0f32,30f32,0f32,0f32] }
+def f [n][m] (is: [n]i64) (dst: [m]f32,vs: [n]f32) =
+  reduce_by_index (copy dst) (*) 1 is vs
 
-def red_mul [n] (is: [n]i64) (vs: [n]f32) =
-  reduce_by_index (replicate 5 1) (*) 1 is vs
+def main [n][m] (is: [n]i64) (dst: [m]f32) (vs: [n]f32) =
+  vjp (f is) (dst,vs) (replicate m 1)
 
-entry rev [n] (is: [n]i64) (vs: [n]f32) =
-  vjp (red_mul is) vs (replicate 5 0 with [0] = 1)
+--    [0i64,0i64,1i64,1i64,1i64,2i64,2i64,3i64,3i64,4i64,4i64,4i64,4i64,5i64,5i64,5i64]
+--    [1f32,2f32,3f32,4f32,5f32,6f32,7f32,0f32,9f32,0f32,11f32,0f32,13f32,14f32,0f32,16f32]
+--    [2f32,1f32,40f32,30f32,24f32,0f32,0f32,36f32,0f32,0f32,0f32,0f32,0f32,0f32,0f32,0f32]
