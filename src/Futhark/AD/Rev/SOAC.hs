@@ -124,12 +124,8 @@ vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
   | isIdentityLambda f,
     [x] <- patNames pat,
     HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
-<<<<<<< HEAD
     lam' <- nestedMapOp lam,
     Just [(op, _, _, _)] <- lamIsBinOp lam',
-=======
-    Just [(op, _, _, _)] <- lamIsBinOp lam,
->>>>>>> ae00772e8c9cfebec11bf452c33784a8715f96ff
     isMulOp op =
     diffMulHist ops x aux n op ne is vs w rf dst m
   | isIdentityLambda f,

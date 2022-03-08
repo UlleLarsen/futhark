@@ -68,7 +68,7 @@ nestedmap [] _ lam = return lam
 nestedmap s@(h : r) pt lam = do
     params <- traverse (\tp -> newParam "x" $ Array tp (Shape s) NoUniqueness) pt
     body <- nestedmap r pt lam
-    mkLambda params $ 
+    mkLambda params $
       fmap varsRes . letTupExp "res" $
         Op $ Screma h (map paramName params) $ mapSOAC body
 
@@ -337,26 +337,34 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   -- part_bar <-
   --   letExp "part_bar" $ Op $ Screma w [dst, x_bar] $ mapSOAC lam_mul'''
 
-  j_param <- newParam "j" $ Prim int64
-  a_param <- newParam "a" $ Prim t
-  lam_vsbar <-
-    mkLambda [j_param, a_param] $
+  inner_params <- zipWithM newParam ["zr_cts", "pr_bar", "nz_prd", "a"] $ map Prim [int64, t, t, t] 
+  let [zr_cts, pr_bar, nz_prd, a_param] = inner_params
+  lam_vsbar_inner <-
+    mkLambda inner_params $
       fmap varsRes . letTupExp "vs_bar" =<< do
-        let j = Slice [DimFix $ Var $ paramName j_param]
-        names <- traverse newVName ["zr_cts", "pr_bar", "nz_prd"]
-        let [zr_cts, pr_bar, nz_prd] = names
-        zipWithM_ (\name -> letBindNames [name] . BasicOp . flip Index j) names [zr_counts, part_bar, nz_prods]
-
         eIf
-          (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 0) (eSubExp $ Var zr_cts))
-          (eBody $ return $ eBinOp mul (eSubExp $ Var pr_bar) $ eBinOp (getBinOpDiv t) (eSubExp $ Var nz_prd) $ eParam a_param)
+          (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 0) (eParam zr_cts))
+          (eBody $ return $ eBinOp mul (eParam pr_bar) $ eBinOp (getBinOpDiv t) (eParam nz_prd) $ eParam a_param)
           (eBody $ return $
             eIf
-              (eBinOp LogAnd (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 1) (eSubExp $ Var zr_cts))
+              (eBinOp LogAnd (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 1) (eParam zr_cts))
                              (eCmpOp (CmpEq t) (eSubExp $ Constant $ blankPrimValue t) $ eParam a_param))
-              (eBody $ return $ eBinOp mul (eSubExp $ Var nz_prd) (eSubExp $ Var pr_bar))
+              (eBody $ return $ eBinOp mul (eParam nz_prd) (eParam pr_bar))
               (eBody $ return $ eSubExp $ Constant $ blankPrimValue t)
           )
+
+  lam_vsbar_middle <- nestedmap (tail vs_dims) [int64, t, t, t] lam_vsbar_inner
+
+  i_param <- newParam "i" $ Prim int64
+  a_param' <- newParam "a" $ rowType vs_type
+  lam_vsbar <- 
+    mkLambda [i_param, a_param'] $ do
+      let i = fullSlice vs_type [DimFix $ Var $ paramName i_param]
+      names <- traverse newVName ["zr_cts", "pr_bar", "nz_prd"]
+      --let [zr_cts, pr_bar, nz_prd] = names
+      zipWithM_ (\name -> letBindNames [name] . BasicOp . flip Index i) names [zr_counts, part_bar, nz_prods]
+      eLambda lam_vsbar_middle $ map (eSubExp . Var) names <> [eParam a_param']
+
   vs_bar <-
     letExp (baseString vs ++ "_bar") $ Op $ Screma n [is, vs] $ mapSOAC lam_vsbar
 
@@ -563,8 +571,8 @@ radixSort' xs n = do
 --     let ls = seg_scan_exe op (false, ne) (zip flag sas)
 --     let rs = reverse (seg_scan_exe op (false, ne) (reverse (zip flag sas)))
 --     let (f_bar, f_dst) = map (\i -> if i < w && -1 < w then (xs_bar[i], dst[i]) else (0,ne)) sis
---     let as_bar' = f f_dst ls as rs
---     as_bar += scatter (Scratch) siota as_bar'
+--     let as_bar' = f f_dst ls sas rs
+--     as_bar += scatter Scratch siota as_bar'
 --
 -- Where:
 --     siota is 'iota n' sorted wrt is
