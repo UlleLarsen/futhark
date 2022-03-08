@@ -587,7 +587,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   flag_lam <- mkFlagLam par_i sis
   flag <- letExp "flag" $ Op $ Screma n [iota_n] $ mapSOAC flag_lam
 
-  -- map (\i -> (if flag[i] then 0 else vs[i-1], if i==0 || flag[n-i] then 0 else vs[n-i])) (iota n)
+  -- map (\i -> (if flag[i] then (true,ne) else (false,vs[i-1]), if i==0 || flag[n-i] then (true,ne) else (false,vs[n-i]))) (iota n)
   par_i' <- newParam "i" $ Prim int64
   let i = paramName par_i'
   g_lam <- mkLambda [par_i'] $
@@ -597,8 +597,8 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
       let s1 = [DimFix im1]
       let s2 = [DimFix nmi]
 
+      -- flag array for left scan
       f1 <- letSubExp "f1" $ BasicOp $ Index flag $ Slice [DimFix $ Var i]
-      f2 <- letSubExp "f2" $ BasicOp $ Index flag $ Slice [DimFix nmi]
 
       r1 <- letTupExp' "r1" =<<
         eIf
@@ -612,15 +612,18 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
             )
           )
 
+      -- tuple with right scan flag array 
       r2 <- letTupExp' "r2" =<<
         eIf
           (toExp $ le64 i .==. pe64 se0)
-          (eBody $ fmap eSubExp ne)
-          (eBody $ return $
+          (eBody $ fmap eSubExp (Constant (onePrimValue Bool) : ne))
+          (eBody $ return $ do
             eIf
-              (eSubExp f2)
-              (eBody $ fmap eSubExp ne)
-              (eBody . fmap eSubExp =<<
+              (return $ BasicOp $ Index flag $ Slice s2)
+              (eBody $ fmap eSubExp (Constant (onePrimValue Bool) : ne))
+              (eBody . fmap eSubExp . (Constant (blankPrimValue Bool) :) =<<
+                -- loop needed in case as is array of tuples
+                -- Futhark internal rep is tuple of arrays
                 forM sas (\x -> do
                   t <- lookupType x
                   letSubExp (baseString x ++ "_elem_2") $
@@ -629,7 +632,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
               )
           )
 
-      traverse eSubExp $ f1 : r1 ++ f2 : r2
+      traverse eSubExp $ f1 : r1 ++ r2
 
   -- scan (\(f1,v1) (f2,v2) ->
   --   let f = f1 || f2
