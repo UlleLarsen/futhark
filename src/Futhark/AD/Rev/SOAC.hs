@@ -114,26 +114,26 @@ vjpSOAC ops pat _aux (Screma w as form) m
     vjpStm ops mapstm $ vjpStm ops redstm m
 vjpSOAC ops pat aux (Scatter w lam ass written_info) m =
   vjpScatter ops pat aux (w, lam, ass, written_info) m
--- vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
---   | isIdentityLambda f,
---     [x] <- patNames pat,
---     HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
---     Just [(op, _, _, _)] <- lamIsBinOp lam,
---     isMinMaxOp op =
---     diffMinMaxHist ops x aux n op ne is vs w rf dst m
---   | isIdentityLambda f,
---     [x] <- patNames pat,
---     HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
---     Just [(op, _, _, _)] <- lamIsBinOp lam,
---     isMulOp op =
---     diffMulHist ops x aux n op ne is vs w rf dst m
---   | isIdentityLambda f,
---     [x] <- patNames pat,
---     HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
---     lam' <- nestedMapOp lam,
---     Just [(op, _, _, _)] <- lamIsBinOp lam',
---     isAddOp op =
---     diffAddHist ops x aux n lam ne is vs w rf dst m
+vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
+  | isIdentityLambda f,
+    [x] <- patNames pat,
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
+    Just [(op, _, _, _)] <- lamIsBinOp lam,
+    isMinMaxOp op =
+    diffMinMaxHist ops x aux n op ne is vs w rf dst m
+  | isIdentityLambda f,
+    [x] <- patNames pat,
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
+    Just [(op, _, _, _)] <- lamIsBinOp lam,
+    isMulOp op =
+    diffMulHist ops x aux n op ne is vs w rf dst m
+  | isIdentityLambda f,
+    [x] <- patNames pat,
+    HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
+    lam' <- nestedMapOp lam,
+    Just [(op, _, _, _)] <- lamIsBinOp lam',
+    isAddOp op =
+    diffAddHist ops x aux n lam ne is vs w rf dst m
 vjpSOAC ops pat aux (Hist n as [histop] f) m
   | isIdentityLambda f,
     HistOp (Shape w) rf dst ne lam <- histop = do
