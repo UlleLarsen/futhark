@@ -64,7 +64,7 @@ isAddOp (Add _ _)   = True
 isAddOp (FAdd _)    = True
 isAddOp _           = False
 
-mapOp :: Lambda -> Maybe Lambda
+mapOp :: Lambda SOACS -> Maybe (Lambda SOACS)
 mapOp (Lambda [pa1, pa2] lam_body _)
   | [SubExpRes cs r] <- bodyResult lam_body,
     cs == mempty,
@@ -76,7 +76,7 @@ mapOp (Lambda [pa1, pa2] lam_body _)
     Just map_lam
 mapOp _ = Nothing
 
-nestedMapOp :: Lambda -> Lambda
+nestedMapOp :: Lambda SOACS -> Lambda SOACS
 nestedMapOp lam =
   maybe lam nestedMapOp (mapOp lam)
 

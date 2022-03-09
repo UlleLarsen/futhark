@@ -46,7 +46,7 @@ withinBounds [] = TPrimExp $ ValueExp (BoolValue True)
 withinBounds [(q, i)] = (le64 i .<. pe64 q) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i)
 withinBounds (qi : qis) = withinBounds [qi] .&&. withinBounds qis
 
-elseIf :: PrimType -> [(Builder SOACS Exp, Builder SOACS Exp)] -> [Builder SOACS Body] -> Builder SOACS Exp
+elseIf :: PrimType -> [(Builder SOACS (Exp SOACS), Builder SOACS (Exp SOACS))] -> [Builder SOACS (Body SOACS)] -> Builder SOACS (Exp SOACS)
 elseIf t [(c1,c2)] [bt,bf] =
   eIf
     (eCmpOp (CmpEq t) c1 c2) bt bf
@@ -63,7 +63,7 @@ bindSubExpRes s =
               certifying cs $ letBindNames [bn] $ BasicOp $ SubExp se
               return bn)
 
-nestedmap :: [SubExp] -> [PrimType] -> Lambda -> ADM Lambda
+nestedmap :: [SubExp] -> [PrimType] -> Lambda SOACS -> ADM (Lambda SOACS)
 nestedmap [] _ lam = return lam
 nestedmap s@(h : r) pt lam = do
     params <- traverse (\tp -> newParam "x" $ Array tp (Shape s) NoUniqueness) pt
@@ -73,7 +73,7 @@ nestedmap s@(h : r) pt lam = do
         Op $ Screma h (map paramName params) $ mapSOAC body
 
 -- \ds hs -> map2 lam ds hs
-mkF' :: Lambda -> [Type] -> SubExp -> ADM ([VName], Lambda)
+mkF' :: Lambda SOACS -> [Type] -> SubExp -> ADM ([VName], Lambda SOACS)
 mkF' lam tps n = do
   lam' <- renameLambda lam
 
@@ -87,7 +87,7 @@ mkF' lam tps n = do
   pure (map paramName ds_params, lam_map)
 
 -- \ls as rs ds -> map (\li ai ri di -> li `lam` ai `lam` ri `lam` di) ls as rs ds
-mkF :: Lambda -> [Type] -> SubExp -> ADM ([VName], Lambda)
+mkF :: Lambda SOACS -> [Type] -> SubExp -> ADM ([VName], Lambda SOACS)
 mkF lam tps n = do
   lam_l <- renameLambda lam
   lam_r <- renameLambda lam
@@ -385,7 +385,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
 --
 --     vs_bar += map (\i -> x_bar[i]) is
 diffAddHist ::
-  VjpOps -> VName -> StmAux () -> SubExp -> Lambda -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
+  VjpOps -> VName -> StmAux () -> SubExp -> Lambda SOACS -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffAddHist _ops x aux n add ne is vs w rf dst m = do
   let t = paramDec $ head $ lambdaParams add
 
@@ -440,7 +440,7 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 --                         case _ -> na+nb+nc+d-1
 --   let is = map2 f bins offsets
 --   in scatter scratch is xs
-radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> Builder SOACS Exp
+radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> Builder SOACS (Exp SOACS)
 radixSortStep xs tps bit n = do
   let is = head xs
 
@@ -580,7 +580,7 @@ radixSort' xs n = do
 --     sas is 'as' sorted wrt is
 --     f' = vjpLambda xs_bar dst (\ds hs -> ds `op` hs)
 --     f  = vjpLambda f_bar as (\ls as rs ds -> map (\li ai ri di -> li `op` ai `op` ri `op` di) ls as rs ds)
-diffHist :: VjpOps -> [VName] -> StmAux () ->  SubExp -> Lambda -> [SubExp] -> [VName] -> [SubExp] -> SubExp -> [VName] -> ADM () -> ADM ()
+diffHist :: VjpOps -> [VName] -> StmAux () ->  SubExp -> Lambda SOACS -> [SubExp] -> [VName] -> [SubExp] -> SubExp -> [VName] -> ADM () -> ADM ()
 diffHist ops xs aux n lam0 ne as w rf dst m = do
   as_type <- traverse lookupType $ tail as
   dst_type <- traverse lookupType dst
@@ -757,7 +757,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   where
     se0 = intConst Int64 0
     se1 = intConst Int64 1
-    mkFlagLam :: LParam -> VName -> ADM Lambda
+    mkFlagLam :: LParam SOACS -> VName -> ADM (Lambda SOACS)
     mkFlagLam par_i sis =
       mkLambda [par_i] $
         fmap varsRes . letTupExp "flag" =<<
