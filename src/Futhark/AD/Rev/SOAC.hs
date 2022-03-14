@@ -80,6 +80,17 @@ nestedMapOp :: Lambda SOACS -> Lambda SOACS
 nestedMapOp lam =
   maybe lam nestedMapOp (mapOp lam)
 
+histomapToMapAndHist :: Pat Type -> (SubExp, [HistOp SOACS], Lambda SOACS, [VName]) -> ADM (Stm SOACS, Stm SOACS)
+histomapToMapAndHist (Pat pes) (w, histops, map_lam, as) = do
+  map_pat <- traverse accMapPatElem $ lambdaReturnType map_lam
+  let map_stm = mkLet map_pat $ Op $ Screma w as $ mapSOAC map_lam
+  new_lam <- mkIdentityLambda $ lambdaReturnType map_lam
+  let hist_stm = Let (Pat pes) (defAux ()) $ Op $ Hist w (map identName map_pat) histops new_lam
+  return (map_stm, hist_stm)
+  where
+    accMapPatElem =
+      newIdent "hist_map_res" . (`arrayOfRow` w)
+
 vjpSOAC :: VjpOps -> Pat Type -> StmAux () -> SOAC SOACS -> ADM () -> ADM ()
 vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just reds <- isReduceSOAC form,
@@ -139,5 +150,10 @@ vjpSOAC ops pat aux (Hist n as [histop] f) m
   | isIdentityLambda f,
     HistOp (Shape w) rf dst ne lam <- histop = do
     diffHist ops (patNames pat) aux n lam ne as w rf dst m
+vjpSOAC ops pat _aux (Hist n as histops f) m
+  | not (isIdentityLambda f) = do
+    (mapstm, redstm) <-
+      histomapToMapAndHist pat (n, histops, f, as)
+    vjpStm ops mapstm $ vjpStm ops redstm m
 vjpSOAC _ _ _ soac _ =
   error $ "vjpSOAC unhandled:\n" ++ pretty soac
