@@ -39,6 +39,18 @@ splitScanRed vjpops (opSOAC, opNeutral) (pat, aux, ops, w, as) m = do
       onOps _ _ _ = m
   onOps ops pat_per_op as_per_op
 
+splitHist :: VjpOps -> Pat Type -> StmAux () -> [HistOp SOACS] -> SubExp -> [VName] -> [VName] -> ADM () -> ADM ()
+splitHist vjpops pat aux ops w is as m = do
+  let ks = map (length . histNeutral) ops
+      pat_per_op = map Pat $ chunks ks $ patElems pat
+      as_per_op = chunks ks as
+      onOps (op : ops') (op_pat : op_pats') (op_is : op_is') (op_as : op_as') = do
+        f <- mkIdentityLambda . (Prim int64:) =<< traverse lookupType op_as
+        vjpSOAC vjpops op_pat aux (Hist w (op_is:op_as) [op] f) $
+          onOps ops' op_pats' op_is' op_as'
+      onOps _ _ _ _ = m
+  onOps ops pat_per_op is as_per_op
+
 commonSOAC :: Pat Type -> StmAux () -> SOAC SOACS -> ADM () -> ADM [Adj]
 commonSOAC pat aux soac m = do
   addStm $ Let pat aux $ Op soac
@@ -125,6 +137,11 @@ vjpSOAC ops pat _aux (Screma w as form) m
     vjpStm ops mapstm $ vjpStm ops redstm m
 vjpSOAC ops pat aux (Scatter w lam ass written_info) m =
   vjpScatter ops pat aux (w, lam, ass, written_info) m
+vjpSOAC ops pat aux (Hist n as histops f) m
+  | isIdentityLambda f,
+    length histops > 1 = do
+    let (is, vs) = splitAt (length histops) as
+    splitHist ops pat aux histops n is vs m
 vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
   | isIdentityLambda f,
     [x] <- patNames pat,
