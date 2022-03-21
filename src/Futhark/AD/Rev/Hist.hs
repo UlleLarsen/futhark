@@ -334,8 +334,6 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   part_bar_res <- eLambda lam_mul''' $ map (eSubExp . Var) [dst, x_bar]
   part_bar' <- bindSubExpRes "part_bar" part_bar_res
   let [part_bar] = part_bar'
-  -- part_bar <-
-  --   letExp "part_bar" $ Op $ Screma w [dst, x_bar] $ mapSOAC lam_mul'''
 
   inner_params <- zipWithM newParam ["zr_cts", "pr_bar", "nz_prd", "a"] $ map Prim [int64, t, t, t] 
   let [zr_cts, pr_bar, nz_prd, a_param] = inner_params
@@ -361,7 +359,6 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
     mkLambda [i_param, a_param'] $ do
       let i = fullSlice vs_type [DimFix $ Var $ paramName i_param]
       names <- traverse newVName ["zr_cts", "pr_bar", "nz_prd"]
-      --let [zr_cts, pr_bar, nz_prd] = names
       zipWithM_ (\name -> letBindNames [name] . BasicOp . flip Index i) names [zr_counts, part_bar, nz_prods]
       eLambda lam_vsbar_middle $ map (eSubExp . Var) names <> [eParam a_param']
 
