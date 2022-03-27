@@ -20,6 +20,15 @@ import Futhark.IR.SOACS
 import Futhark.Tools
 import Futhark.Transform.Rename
 
+eUnOp ::
+  MonadBuilder m =>
+  UnOp ->
+  m (Exp (Rep m)) ->
+  m (Exp (Rep m))
+eUnOp op x = do
+  x' <- letSubExp "x" =<< x
+  return $ BasicOp $ UnOp op x'
+
 getBinOpPlus :: PrimType -> BinOp
 getBinOpPlus (IntType x) = Add x OverflowUndef
 getBinOpPlus (FloatType f) = FAdd f
@@ -335,7 +344,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   part_bar' <- bindSubExpRes "part_bar" part_bar_res
   let [part_bar] = part_bar'
 
-  inner_params <- zipWithM newParam ["zr_cts", "pr_bar", "nz_prd", "a"] $ map Prim [int64, t, t, t] 
+  inner_params <- zipWithM newParam ["zr_cts", "pr_bar", "nz_prd", "a"] $ map Prim [int64, t, t, t]
   let [zr_cts, pr_bar, nz_prd, a_param] = inner_params
   lam_vsbar_inner <-
     mkLambda inner_params $
@@ -355,7 +364,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
 
   i_param <- newParam "i" $ Prim int64
   a_param' <- newParam "a" $ rowType vs_type
-  lam_vsbar <- 
+  lam_vsbar <-
     mkLambda [i_param, a_param'] $ do
       let i = fullSlice vs_type [DimFix $ Var $ paramName i_param]
       names <- traverse newVName ["zr_cts", "pr_bar", "nz_prd"]
@@ -511,13 +520,15 @@ radixSortStep xs tps bit n = do
 -- def radix_sort [n] 't (xs: [n]i64) =
 --   let iters = if n == 0 then 0 else 32
 --   in loop xs for i < iters do radix_sort_step xs i64.get_bit (i*2)
-radixSort :: [VName] -> SubExp -> ADM [VName]
-radixSort xs n = do
-  iters <- letSubExp "iters" =<<
-    eIf
-      (eCmpOp (CmpEq int64) (eSubExp n) (eSubExp $ Constant $ blankPrimValue int64))
-      (eBody $ return $ eSubExp $ Constant $ blankPrimValue int64)
-      (eBody $ return $ eSubExp $ intConst Int64 32)
+radixSort :: [VName] -> SubExp -> SubExp -> ADM [VName]
+radixSort xs n w = do
+  -- iters <- letSubExp "iters" =<<
+  --   eIf
+  --     (eCmpOp (CmpEq int64) (eSubExp n) (eSubExp $ Constant $ blankPrimValue int64))
+  --     (eBody $ return $ eSubExp $ Constant $ blankPrimValue int64)
+  --     (eBody $ return $ eSubExp $ intConst Int64 32)
+  logn <- log2 w
+  iters <- letSubExp "iters" =<< toExp (untyped (pe64 logn + pe64 (intConst Int64 1)) ~/~ untyped (pe64 (intConst Int64 2)))
 
   types <- traverse lookupType xs
   params <- zipWithM (\x -> newParam (baseString x) . flip toDecl Nonunique) xs types
@@ -532,14 +543,36 @@ radixSort xs n = do
       (zip params $ map Var xs)
       (ForLoop i Int64 iters [])
       loopbody
+  where
+    log2 :: SubExp -> ADM SubExp
+    log2 m = do
+      params <- zipWithM newParam ["cond","r","i"] $ map Prim [Bool, int64, int64]
+      let [cond,r,i]  = params
 
-radixSort' :: [VName] -> SubExp -> ADM [VName]
-radixSort' xs n = do
+      body <- buildBody_ . localScope (scopeOfFParams params) $ do
+        r' <- letSubExp "r'" =<< eBinOp (AShr Int64) (eParam r) (eSubExp $ Constant $ onePrimValue int64)
+        cond' <- letSubExp "cond'" =<< eUnOp Not (eCmpOp (CmpEq int64) (eSubExp r') (eSubExp $ Constant $ blankPrimValue int64))
+        i' <- letSubExp "i'" =<< eBinOp (Add Int64 OverflowUndef) (eParam i) (eSubExp $ Constant $ onePrimValue int64)
+        return $ subExpsRes [cond',r',i']
+
+      cond_init <- letSubExp "test" =<< eUnOp Not (eCmpOp (CmpEq int64) (eSubExp m) (eSubExp $ Constant $ blankPrimValue int64))
+
+      l <- letTupExp' "log2res" $
+        DoLoop
+          (zip params [cond_init,m,Constant $ blankPrimValue int64])
+          (WhileLoop $ paramName cond)
+          body
+
+      let [_,_,res] = l
+      return res
+
+radixSort' :: [VName] -> SubExp -> SubExp -> ADM [VName]
+radixSort' xs n w = do
   iota_n <-
     letExp "red_iota" $
       BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
 
-  radres <- radixSort [head xs, iota_n] n
+  radres <- radixSort [head xs, iota_n] n w
   let [is', iota'] = radres
 
   types <- traverse lookupType xs
@@ -610,7 +643,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   lam <- renameLambda lam0
   lam' <- renameLambda lam0
 
-  sorted <- radixSort' as n
+  sorted <- radixSort' as n $ head w
   let siota = head sorted
   let sis = head $ tail sorted
   let sas = drop 2 sorted
@@ -765,6 +798,5 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
               i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam par_i) (eSubExp $ Constant $ onePrimValue int64)
               let [vs_i, vs_p] = map (BasicOp . Index sis . Slice . return . DimFix . Var) [paramName par_i, i_p]
 
-              t <- letSubExp "tmp" =<< eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
-              return $ BasicOp $ UnOp Not t
+              eUnOp Not $ eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
             )
