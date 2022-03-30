@@ -125,6 +125,18 @@ mkF lam tps n = do
 
   pure (map paramName as_params, lam_map)
 
+mapout :: VName -> SubExp -> SubExp -> ADM VName
+mapout is n w = do
+  par_is <- newParam "is" $ Prim int64
+  is'_lam <- mkLambda [par_is] $
+    fmap varsRes . letTupExp "is'" =<<
+      eIf
+        (toExp $ withinBounds $ return (w, paramName par_is))
+        (eBody $ return $ eParam par_is)
+        (eBody $ return $ toExp (pe64 w + 1))
+
+  letExp "is'" $ Op $ Screma n (return is) $ mapSOAC is'_lam
+
 --
 -- special case of histogram with min/max as operator.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
@@ -446,9 +458,19 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 --                         case _ -> na+nb+nc+d-1
 --   let is = map2 f bins offsets
 --   in scatter scratch is xs
-radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> Builder SOACS (Exp SOACS)
-radixSortStep xs tps bit n = do
+radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> SubExp -> Builder SOACS (Exp SOACS)
+radixSortStep xs tps bit n w = do
   let is = head xs
+
+  -- par_is <- newParam "is" $ Prim int64
+  -- is'_lam <- mkLambda [par_is] $
+  --   fmap varsRes . letTupExp "is'" =<<
+  --     eIf
+  --       (toExp $ withinBounds $ return (w, paramName par_is))
+  --       (eBody $ return $ eParam par_is)
+  --       (eBody $ return $ toExp (pe64 w + 1))
+
+  -- is <- letExp "is'" $ Op $ Screma n (return $ head xs) $ mapSOAC is'_lam
 
   num_param <- newParam "num" $ Prim int64
   num_lam <- mkLambda [num_param] $
@@ -527,8 +549,9 @@ radixSort xs n w = do
   --     (eCmpOp (CmpEq int64) (eSubExp n) (eSubExp $ Constant $ blankPrimValue int64))
   --     (eBody $ return $ eSubExp $ Constant $ blankPrimValue int64)
   --     (eBody $ return $ eSubExp $ intConst Int64 32)
-  logn <- log2 w
-  iters <- letSubExp "iters" =<< toExp (untyped (pe64 logn + pe64 (intConst Int64 1)) ~/~ untyped (pe64 (intConst Int64 2)))
+  logw <- log2 =<< letSubExp "w1" =<< toExp (pe64 w + 1)
+  -- ceil logw by (logw + 1) / 2
+  iters <- letSubExp "iters" =<< toExp (untyped (pe64 logw + pe64 (intConst Int64 1)) ~/~ untyped (pe64 (intConst Int64 2)))
 
   types <- traverse lookupType xs
   params <- zipWithM (\x -> newParam (baseString x) . flip toDecl Nonunique) xs types
@@ -536,7 +559,7 @@ radixSort xs n w = do
   loopbody <- runBodyBuilder . localScope (scopeOfFParams params) $ eBody $ return $ do
     bit <- letSubExp "bit" =<<
       eBinOp (Mul Int64 OverflowUndef) (eSubExp $ Var i) (eSubExp $ intConst Int64 2)
-    radixSortStep (map paramName params) types bit n
+    radixSortStep (map paramName params) types bit n w
 
   letTupExp "sorted" $
     DoLoop
@@ -643,7 +666,18 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   lam <- renameLambda lam0
   lam' <- renameLambda lam0
 
-  sorted <- radixSort' as n $ head w
+  par_is <- newParam "is" $ Prim int64
+  is'_lam <- mkLambda [par_is] $
+    fmap varsRes . letTupExp "is'" =<<
+      eIf
+        (toExp $ withinBounds $ return (head w, paramName par_is))
+        (eBody $ return $ eParam par_is)
+        (eBody $ return $ toExp (pe64 (head w) + 1))
+
+  is' <- letExp "is'" $ Op $ Screma n (return $ head as) $ mapSOAC is'_lam
+
+  sorted <- radixSort' (is' : tail as) n $ head w
+  -- sorted <- radixSort' as n $ head w
   let siota = head sorted
   let sis = head $ tail sorted
   let sas = drop 2 sorted
