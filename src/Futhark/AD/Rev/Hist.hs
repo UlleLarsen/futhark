@@ -55,7 +55,7 @@ withinBounds [] = TPrimExp $ ValueExp (BoolValue True)
 withinBounds [(q, i)] = (le64 i .<. pe64 q) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i)
 withinBounds (qi : qis) = withinBounds [qi] .&&. withinBounds qis
 
-elseIf :: PrimType -> [(Builder SOACS (Exp SOACS), Builder SOACS (Exp SOACS))] -> [Builder SOACS (Body SOACS)] -> Builder SOACS (Exp SOACS)
+elseIf :: PrimType -> [(ADM (Exp SOACS), ADM (Exp SOACS))] -> [ADM (Body SOACS)] -> ADM (Exp SOACS)
 elseIf t [(c1,c2)] [bt,bf] =
   eIf
     (eCmpOp (CmpEq t) c1 c2) bt bf
@@ -136,6 +136,27 @@ mapout is n w = do
         (eBody $ return $ toExp (pe64 w + 1))
 
   letExp "is'" $ Op $ Screma n (return is) $ mapSOAC is'_lam
+
+multiScatter :: SubExp -> [VName] -> VName -> [VName] -> ADM [VName]
+multiScatter n dst is vs = do
+  tps <- traverse lookupType vs
+  par_i <- newParam "i" $ Prim int64
+  scatter_params <- traverse (newParam "scatter_param" . rowType) tps
+  scatter_lam <- mkLambda (par_i : scatter_params) $
+    fmap subExpsRes . letSubExps "scatter_map_res" =<< do
+      p1 <- replicateM (length scatter_params) $ eParam par_i
+      p2 <- traverse eParam scatter_params
+      return $ p1 <> p2
+
+  letTupExp "scatter_res" $
+    Op $ Scatter n (is : vs) scatter_lam $
+      zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) tps dst
+
+multiIndex :: [VName] -> [DimIndex SubExp] -> ADM [VName]
+multiIndex vs s = do
+  traverse (\x -> do
+    t <- lookupType x
+    letExp "sorted" $ BasicOp $ Index x (fullSlice t s)) vs
 
 --
 -- special case of histogram with min/max as operator.
@@ -458,19 +479,19 @@ diffAddHist _ops x aux n add ne is vs w rf dst m = do
 --                         case _ -> na+nb+nc+d-1
 --   let is = map2 f bins offsets
 --   in scatter scratch is xs
-radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> SubExp -> Builder SOACS (Exp SOACS)
+radixSortStep :: [VName] -> [Type] -> SubExp -> SubExp -> SubExp -> ADM [VName]
 radixSortStep xs tps bit n w = do
-  let is = head xs
+  -- let is = head xs
 
-  -- par_is <- newParam "is" $ Prim int64
-  -- is'_lam <- mkLambda [par_is] $
-  --   fmap varsRes . letTupExp "is'" =<<
-  --     eIf
-  --       (toExp $ withinBounds $ return (w, paramName par_is))
-  --       (eBody $ return $ eParam par_is)
-  --       (eBody $ return $ toExp (pe64 w + 1))
+  par_is <- newParam "is" $ Prim int64
+  is'_lam <- mkLambda [par_is] $
+    fmap varsRes . letTupExp "is'" =<<
+      eIf
+        (toExp $ withinBounds $ return (w, paramName par_is))
+        (eBody $ return $ eParam par_is)
+        (eBody $ return $ toExp (pe64 w + 1))
 
-  -- is <- letExp "is'" $ Op $ Screma n (return $ head xs) $ mapSOAC is'_lam
+  is <- letExp "is'" $ Op $ Screma n (return $ head xs) $ mapSOAC is'_lam
 
   num_param <- newParam "num" $ Prim int64
   num_lam <- mkLambda [num_param] $
@@ -524,16 +545,8 @@ radixSortStep xs tps bit n w = do
 
   nis <- letExp "nis" $ Op $ Screma n (bins : offsets) $ mapSOAC map_lam
 
-  ind_param <- newParam "ind_param" $ Prim int64
-  scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType tps
-  scatter_lam <- mkLambda (ind_param : scatter_params) $
-    fmap subExpsRes . letSubExps "scatter_map_res" =<< do
-      p1 <- replicateM (length scatter_params) $ eParam ind_param
-      p2 <- traverse eParam scatter_params
-      return $ p1 ++ p2
-
   scatter_dst <- traverse (\t -> letExp "scatter_dst" $ BasicOp $ Scratch (elemType t) (arrayDims t)) tps
-  return $ Op $ Scatter n (nis : xs) scatter_lam $ zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) tps scatter_dst
+  multiScatter n scatter_dst nis xs
   where
     iConst c = eSubExp $ intConst Int64 c
 
@@ -556,10 +569,10 @@ radixSort xs n w = do
   types <- traverse lookupType xs
   params <- zipWithM (\x -> newParam (baseString x) . flip toDecl Nonunique) xs types
   i <- newVName "i"
-  loopbody <- runBodyBuilder . localScope (scopeOfFParams params) $ eBody $ return $ do
-    bit <- letSubExp "bit" =<<
-      eBinOp (Mul Int64 OverflowUndef) (eSubExp $ Var i) (eSubExp $ intConst Int64 2)
-    radixSortStep (map paramName params) types bit n w
+  loopbody <- buildBody_ . localScope (scopeOfFParams params) $
+    fmap varsRes $ do
+      bit <- letSubExp "bit" =<< toExp (le64 i * 2)
+      radixSortStep (map paramName params) types bit n w
 
   letTupExp "sorted" $
     DoLoop
@@ -598,12 +611,10 @@ radixSort' xs n w = do
   radres <- radixSort [head xs, iota_n] n w
   let [is', iota'] = radres
 
-  types <- traverse lookupType xs
   i_param <- newParam "i" $ Prim int64
   let slice = [DimFix $ Var $ paramName i_param]
   map_lam <- mkLambda [i_param] $
-    fmap subExpsRes . letSubExps "sorted" $
-      zipWith (\t -> BasicOp . flip Index (fullSlice t slice)) (tail types) (tail xs)
+    varsRes <$> multiIndex (tail xs) slice
 
   sorted <- letTupExp "sorted" $ Op $ Screma n (tail radres) $ mapSOAC map_lam
   return $ iota' : is' : sorted
@@ -666,18 +677,18 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   lam <- renameLambda lam0
   lam' <- renameLambda lam0
 
-  par_is <- newParam "is" $ Prim int64
-  is'_lam <- mkLambda [par_is] $
-    fmap varsRes . letTupExp "is'" =<<
-      eIf
-        (toExp $ withinBounds $ return (head w, paramName par_is))
-        (eBody $ return $ eParam par_is)
-        (eBody $ return $ toExp (pe64 (head w) + 1))
+  -- par_is <- newParam "is" $ Prim int64
+  -- is'_lam <- mkLambda [par_is] $
+  --   fmap varsRes . letTupExp "is'" =<<
+  --     eIf
+  --       (toExp $ withinBounds $ return (head w, paramName par_is))
+  --       (eBody $ return $ eParam par_is)
+  --       (eBody $ return $ toExp (pe64 (head w) + 1))
 
-  is' <- letExp "is'" $ Op $ Screma n (return $ head as) $ mapSOAC is'_lam
+  -- is' <- letExp "is'" $ Op $ Screma n (return $ head as) $ mapSOAC is'_lam
 
-  sorted <- radixSort' (is' : tail as) n $ head w
-  -- sorted <- radixSort' as n $ head w
+  -- sorted <- radixSort' (is' : tail as) n $ head w
+  sorted <- radixSort' as n $ head w
   let siota = head sorted
   let sis = head $ tail sorted
   let sas = drop 2 sorted
@@ -707,15 +718,9 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
         eIf
           (eSubExp f1)
           (eBody $ fmap eSubExp ne)
-          (eBody . fmap eSubExp =<<
-            forM sas (\x -> do
-              t <- lookupType x
-              letSubExp (baseString x ++ "_elem_1") $
-                BasicOp $ Index x $ fullSlice t s1
-            )
-          )
+          (eBody . fmap (eSubExp . Var) =<< multiIndex sas s1)
 
-      -- tuple with right scan flag array 
+      -- array for right scan inc flag
       r2 <- letTupExp' "r2" =<<
         eIf
           (toExp $ le64 i .==. pe64 se0)
@@ -724,15 +729,8 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
             eIf
               (return $ BasicOp $ Index flag $ Slice s2)
               (eBody $ fmap eSubExp (Constant (onePrimValue Bool) : ne))
-              (eBody . fmap eSubExp . (Constant (blankPrimValue Bool) :) =<<
-                -- loop needed in case as is array of tuples
-                -- Futhark internal rep is tuple of arrays
-                forM sas (\x -> do
-                  t <- lookupType x
-                  letSubExp (baseString x ++ "_elem_2") $
-                    BasicOp $ Index x $ fullSlice t s2
-                )
-              )
+              (eBody . fmap eSubExp . (Constant (blankPrimValue Bool):) . fmap Var
+                =<< multiIndex sas s2)
           )
 
       traverse eSubExp $ f1 : r1 ++ r2
@@ -773,10 +771,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
     fmap varsRes . letTupExp "scan_res" =<<
       eIf
         (toExp $ (le64 i'' .<. pe64 (head w)) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i''))
-        (eBody $ do
-          zipWith (\x t ->
-            return $ BasicOp $ Index x $ fullSlice t [DimFix $ Var $ paramName par_i'']) (xs_bar ++ dst) (as_type ++ as_type)
-        )
+        (eBody . fmap (eSubExp . Var) =<< multiIndex (xs_bar ++ dst) [DimFix $ Var $ paramName par_i''])
         (eBody $ do
           let xs_bar_ne = map (\t -> return $ BasicOp $ Replicate (Shape $ tail $ arrayDims t) (Constant $ blankPrimValue $ elemType t)) as_type
           let dst_ne = map eSubExp ne
@@ -791,31 +786,17 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
 
   -- map (\i -> rs_arr_rev[n-i-1]) (iota n)
   par_i''' <- newParam "i" $ Prim int64
-  rev_lam <- mkLambda [par_i'''] $
-    varsRes <$>
-      zipWithM (\x t -> do
-        nmim1 <- letSubExp "n_i_1" =<< toExp (pe64 n - le64 (paramName par_i''') - pe64 se1)
-        letExp (baseString x) $
-          BasicOp $ Index x $ fullSlice t [DimFix nmim1]
-      ) rs_arr_rev as_type
-
+  rev_lam <- mkLambda [par_i'''] $ do
+    nmim1 <- letSubExp "n_i_1" =<< toExp (pe64 n - le64 (paramName par_i''') - pe64 se1)
+    varsRes <$> multiIndex rs_arr_rev [DimFix nmim1]
+    
   rs_arr <- letTupExp "rs_arr" $ Op $ Screma n [iota_n] $ mapSOAC rev_lam
 
-  sas_bar' <- eLambda f_adj $ map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr
-  sas_bar <- bindSubExpRes "sas_bar" sas_bar'
-
-  par_i'''' <- newParam "i" $ Prim int64
-  scatter_params <- zipWithM newParam (map (flip (++) "_param" . baseString) xs) $ map rowType as_type
-  scatter_lam <- mkLambda (par_i'''' : scatter_params) $
-    fmap subExpsRes . letSubExps "scatter_map_res" =<< do
-      p1 <- replicateM (length scatter_params) $ eParam par_i''''
-      p2 <- traverse eParam scatter_params
-      return $ p1 <> p2
+  sas_bar <- bindSubExpRes "sas_bar" =<<
+    eLambda f_adj (map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr)
 
   scatter_dst <- traverse (\t -> letExp "scatter_dst" $ BasicOp $ Scratch (elemType t) (arrayDims t)) as_type
-  as_bar <- letTupExp "as_bar" $
-    Op $ Scatter n (siota : sas_bar) scatter_lam $
-      zipWith (\t -> (,,) (Shape $ return $ arraySize 0 t) 1) as_type scatter_dst
+  as_bar <- multiScatter n scatter_dst siota sas_bar
 
   zipWithM_ updateAdj (tail as) as_bar
   where
@@ -830,7 +811,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
             (eBody $ return $ eSubExp $ Constant $ onePrimValue Bool)
             (eBody $ return $ do
               i_p <- letExp "i_p" =<< eBinOp (Sub Int64 OverflowUndef) (eParam par_i) (eSubExp $ Constant $ onePrimValue int64)
-              let [vs_i, vs_p] = map (BasicOp . Index sis . Slice . return . DimFix . Var) [paramName par_i, i_p]
+              let [vs_i, vs_p] = map (return . BasicOp . Index sis . Slice . return . DimFix . Var) [paramName par_i, i_p]
 
-              eUnOp Not $ eCmpOp (CmpEq int64) (return vs_i) (return vs_p)
+              eUnOp Not $ eCmpOp (CmpEq int64) vs_i vs_p
             )
