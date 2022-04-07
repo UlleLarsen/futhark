@@ -86,7 +86,7 @@ mkF' lam tps n = do
 
   pure (map paramName ds_params, lam_map)
 
--- \ls as rs ds -> map (\li ai ri di -> li `lam` ai `lam` ri `lam` di) ls as rs ds
+-- \ds ls as rs -> map4 (\di li ai ri -> di `lam` li `lam` ai `lam` ri) ds ls as rs
 mkF :: Lambda SOACS -> [Type] -> SubExp -> ADM ([VName], Lambda SOACS)
 mkF lam tps n = do
   lam_l <- renameLambda lam
@@ -606,28 +606,31 @@ radixSort' xs n w = do
 --
 -- generic case of histogram.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
---     let xs = reduce_by_index dst op ne is as
+--     let xs = reduce_by_index dst odot ne is as
 -- Forward sweep:
---     let nes = replicate w ne
---     let h_part = reduce_by_index nes op ne is as
---     let xs = map2 op dst h_part
---
+  -- let h_part = reduce_by_index nes odot ne is as
+  -- let xs = map2 odot dst h_part
 -- Reverse sweep:
---     dst_bar += f' dst h_part
---
---     let flag = map (\i -> if i == 0 then true else sis[i] != sis[i-1]) (iota n)
---     let ls = seg_scan_exe op (false, ne) (zip flag sas)
---     let rs = reverse (seg_scan_exe op (false, ne) (reverse (zip flag sas)))
---     let (f_bar, f_dst) = map (\i -> if i < w && -1 < w then (xs_bar[i], dst[i]) else (0,ne)) sis
---     let as_bar' = f f_dst ls sas rs
---     as_bar += scatter Scratch siota as_bar'
---
+  -- dst_bar += f' dst h_part
+  -- let flag = map (\i -> i == 0 || sis[i] != sis[i-1]) (iota n)
+  -- let flag_rev = map (\i -> i==0 || flag[n-i]) (iota n)
+  -- let ls = seg_scan_exc odot ne flag sas
+  -- let rs = reverse sas |> 
+  --          seg_scan_exc odot ne flag_rev |> reverse
+  -- let (f_bar, f_dst) = map (\i -> if i < w && -1 < w 
+  --                                then (xs_bar[i], dst[i]) 
+  --                                else (0s, ne))
+  --                          sis
+  -- let sas_bar = f f_dst ls sas rs
+  -- as_bar += scatter (Scratch alpha n) siota sas_bar
 -- Where:
---     siota is 'iota n' sorted wrt is
---     sis is 'is' sorted wrt is
---     sas is 'as' sorted wrt is
---     f' = vjpLambda xs_bar dst (\ds hs -> ds `op` hs)
---     f  = vjpLambda f_bar as (\ls as rs ds -> map (\li ai ri di -> li `op` ai `op` ri `op` di) ls as rs ds)
+--  nes = replicate w ne
+--  siota is 'iota n' sorted wrt 'is'
+--  sis is 'is' sorted wrt 'is'
+--  sas is 'as' sorted wrt 'is'
+--  f' = vjpLambda xs_bar dst (map2 odot)
+--  f  = vjpLambda f_bar sas (map4 (\di li ai ri -> di odot li odot ai odot ri))
+--  0s is an alpha-dimensional array with 0 (possibly 0-dim)
 diffHist :: VjpOps -> [VName] -> StmAux () ->  SubExp -> Lambda SOACS -> [SubExp] -> [VName] -> [SubExp] -> SubExp -> [VName] -> ADM () -> ADM ()
 diffHist ops xs aux n lam0 ne as w rf dst m = do
   as_type <- traverse lookupType $ tail as
