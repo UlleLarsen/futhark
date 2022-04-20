@@ -3,14 +3,14 @@
 -- entry: fwd_J rev_J
 -- compiled input { [[1f32, 2f32], [4f32, 3f32], [3f32, 4f32], [4f32, 2f32]] }
 -- output {
--- [[[1f32, 0f32], [3f32, 0f32], [12f32, 0f32], [24f32, 0f32]],
---  [[0f32, 1f32], [0f32, 3f32], [0f32, 12f32], [0f32, 24f32]],
---  [[0f32, 0f32], [1f32, 0f32], [4f32, 0f32], [8f32, 0f32]],
---  [[0f32, 0f32], [1f32, 2f32], [4f32, 8f32], [8f32, 16f32]],
---  [[0f32, 0f32], [0f32, 0f32], [1f32, 0f32], [2f32, 0f32]],
---  [[0f32, 0f32], [0f32, 0f32], [7f32, 6f32], [14f32, 12f32]],
---  [[0f32, 0f32], [0f32, 0f32], [0f32, 0f32], [1f32, 0f32]],
---  [[0f32, 0f32], [0f32, 0f32], [0f32, 0f32], [31f32, 24f32]]]
+-- [[[[1f32, 0f32], [0f32, 0f32], [0f32, 0f32], [0f32, 0f32]], 
+--   [[0f32, 1f32], [0f32, 0f32], [0f32, 0f32], [0f32, 0f32]]], 
+--  [[[3f32, 0f32], [1f32, 1f32], [0f32, 0f32], [0f32, 0f32]], 
+--   [[0f32, 3f32], [0f32, 2f32], [0f32, 0f32], [0f32, 0f32]]], 
+--  [[[12f32, 0f32], [4f32, 4f32], [1f32, 7f32], [0f32, 0f32]], 
+--   [[0f32, 12f32], [0f32, 8f32], [0f32, 6f32], [0f32, 0f32]]], 
+--  [[[24f32, 0f32], [8f32, 8f32], [2f32, 14f32], [1f32, 31f32]], 
+--   [[0f32, 24f32], [0f32, 16f32], [0f32, 12f32], [0f32, 24f32]]]]
 -- }
 
 def primal [n] (xs: [n](f32,f32)) =
@@ -25,9 +25,9 @@ def onehot_2d n m x y =
 entry fwd_J [n] (input: [n][2]f32) =
   let input = fromarrs input
   in tabulate (n*2) (\i -> jvp primal input (fromarrs (onehot_2d n 2 (i/2) (i%2))))
-     |> map toarrs
+     |> map toarrs |> transpose |> map transpose |> map (map (unflatten n 2))
 
 entry rev_J [n] (input: [n][2]f32) =
   let input = fromarrs input
-  in tabulate (n*2) (\i -> jvp primal input (fromarrs (onehot_2d n 2 (i/2) (i%2))))
-     |> map toarrs
+  in tabulate (n*2) (\i -> vjp primal input (fromarrs (onehot_2d n 2 (i/2) (i%2))))
+     |> unflatten n 2 |> map (map toarrs)

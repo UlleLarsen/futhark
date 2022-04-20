@@ -30,17 +30,6 @@ getBinOpDiv (IntType t) = SDiv t Unsafe
 getBinOpDiv (FloatType t) = FDiv t
 getBinOpDiv _ = error "In getBinOpDiv, Hist.hs: input not supported"
 
-onePrimValue :: PrimType -> PrimValue
-onePrimValue (IntType Int8) = IntValue $ Int8Value 1
-onePrimValue (IntType Int16) = IntValue $ Int16Value 1
-onePrimValue (IntType Int32) = IntValue $ Int32Value 1
-onePrimValue (IntType Int64) = IntValue $ Int64Value 1
-onePrimValue (FloatType Float16) = FloatValue $ Float16Value 1.0
-onePrimValue (FloatType Float32) = FloatValue $ Float32Value 1.0
-onePrimValue (FloatType Float64) = FloatValue $ Float64Value 1.0
-onePrimValue Bool = BoolValue True
-onePrimValue Unit = UnitValue
-
 withinBounds :: [(SubExp, VName)] -> TPrimExp Bool VName
 withinBounds [] = TPrimExp $ ValueExp (BoolValue True)
 withinBounds [(q, i)] = (le64 i .<. pe64 q) .&&. (pe64 (intConst Int64 (-1)) .<. le64 i)

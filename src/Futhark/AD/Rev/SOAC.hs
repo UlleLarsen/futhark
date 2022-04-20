@@ -119,6 +119,9 @@ vjpSOAC ops pat aux soac@(Screma w as form) m
     pat_adj <- mapM adjVal =<< commonSOAC pat aux soac m
     diffReduce ops pat_adj w as red
 vjpSOAC ops pat aux soac@(Screma w as form) m
+  | Just [Scan lam ne] <- isScanSOAC form, 
+    Just op <- mapOp lam = do
+      diffScanVec ops (patNames pat) aux w op ne as m
   | Just scans <- isScanSOAC form,
     length scans > 1 =
     splitScanRed ops (scanSOAC, scanNeutral) (pat, aux, scans, w, as) m
