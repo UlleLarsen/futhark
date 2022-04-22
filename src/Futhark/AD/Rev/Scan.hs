@@ -1,4 +1,4 @@
-module Futhark.AD.Rev.Scan (diffScan, diffScanVec) where
+module Futhark.AD.Rev.Scan (diffScan, diffScanVec, diffScanAdd) where
 
 import Control.Monad
 import Futhark.AD.Rev.Monad
@@ -139,11 +139,10 @@ mkScan2ndMaps w d (arr_tp, y_adj, (ds, cs)) = do
 -- let xs_contribs =
 --    map3 (\ i a r -> if i==0 then r else (df2dy (ys[i-1]) a) \bar{*} r)
 --         (iota n) xs rs
-mkScanFinalMap :: VjpOps -> SubExp -> Int -> Lambda SOACS -> [VName] -> [VName] -> [VName] -> ADM [VName]
-mkScanFinalMap ops w d scan_lam xs ys rs = do
+mkScanFinalMap :: VjpOps -> SubExp -> Lambda SOACS -> [VName] -> [VName] -> [VName] -> ADM [VName]
+mkScanFinalMap ops w scan_lam xs ys rs = do
   let eltps = lambdaReturnType scan_lam
-  idmat <- identityM (length ys) $ head eltps
-  lams <- traverse (mkScanAdjointLam ops scan_lam WrtSecond) idmat
+
   par_i <- newParam "i" $ Prim int64
   let i = paramName par_i
   par_x <- zipWithM (\x -> newParam (baseString x ++ "_par_x")) xs eltps
@@ -156,21 +155,15 @@ mkScanFinalMap ops w d scan_lam xs ys rs = do
           (toExp $ le64 i .==. 0)
           (resultBodyM $ map (Var . paramName) par_r)
           ( buildBody_ $ do
+              lam <- mkScanAdjointLam ops scan_lam WrtSecond $ fmap (Var . paramName) par_r
+
               im1 <- letSubExp "im1" =<< toExp (le64 i - 1)
               ys_im1 <- forM ys $ \y -> do
                 y_t <- lookupType y
                 letSubExp (baseString y ++ "_last") $ BasicOp $ Index y $ fullSlice y_t [DimFix im1]
 
               let args = map eSubExp $ ys_im1 ++ map (Var . paramName) par_x
-              lam_rs <-
-                mapM (letExp "const" . BasicOp . SubExp . resSubExp) . concat . transpose
-                  =<< traverse (`eLambda` args) lams
-              let pt = elemType $ head eltps
-              let pet = primExpFromSubExp pt . Var
-              fmap subExpsRes $ do
-                let [lam_rs',r'] = (fmap . fmap) pet [lam_rs, fmap paramName par_r]
-                let x1 = matrixVecMul lam_rs' r' d pt
-                traverse (letSubExp "r" <=< toExp) x1
+              eLambda lam args
           )
 
   iota <- letExp "iota" $ BasicOp $ Iota w (intConst Int64 0) (intConst Int64 1) Int64
@@ -189,14 +182,12 @@ diffScan ops ys w as scan = do
     letTupExp "adj_ctrb_scan" $
       Op (Screma w [iota] (ScremaForm [scans_lin_fun_o] [] map1_lam))
   red_nms <- mkScan2ndMaps w d (head as_ts, ys_adj, splitAt d r_scan)
-  as_contribs <- mkScanFinalMap ops w d (scanLambda scan) as ys red_nms
+  as_contribs <- mkScanFinalMap ops w (scanLambda scan) as ys red_nms
   zipWithM_ updateAdj as as_contribs
 
 diffScanVec :: VjpOps -> [VName] -> StmAux () -> SubExp -> Lambda SOACS ->
                  [SubExp] -> [VName] -> ADM () -> ADM ()
 diffScanVec ops ys aux w lam ne as m = do
-  --ts <- traverse lookupType as
-
   stmts <- collectStms_ $ do
     rank <- arrayRank <$> lookupType (head as)
     let rear = [1,0] ++ drop 2 [0..rank-1]
@@ -224,3 +215,33 @@ diffScanVec ops ys aux w lam ne as m = do
         BasicOp $ Rearrange rear x) ys transp_ys
 
   foldr (vjpStm ops) m stmts
+
+diffScanAdd :: VjpOps -> VName -> SubExp -> Lambda SOACS -> SubExp -> VName -> ADM ()
+diffScanAdd _ops ys n lam' ne as = do
+  lam <- renameLambda lam'
+  ys_bar <- lookupAdjVal ys
+
+  map_scan <- rev_arr_lam ys_bar
+
+  iota <- letExp "iota" $ 
+    BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
+
+  scan_res <- letExp "res_rev" $ 
+    Op $ Screma n [iota] $ ScremaForm [Scan lam [ne]] [] map_scan
+  
+  rev_lam <- rev_arr_lam scan_res
+  contrb <- letExp "contrb" $ 
+    Op $ Screma n [iota] $ mapSOAC rev_lam
+
+  updateAdj as contrb
+  where
+    rev_arr_lam :: VName -> ADM (Lambda SOACS)
+    rev_arr_lam arr = do
+      t <- lookupType arr
+      par_i <- newParam "i" $ Prim int64
+      mkLambda [par_i] $ do
+        nmim1 <- letSubExp "nmim1" =<< 
+          toExp (pe64 n - le64 (paramName par_i) - 1)
+        a <- letExp "ys_bar_rev" $ 
+          BasicOp $ Index arr $ fullSlice t [DimFix nmim1]
+        pure [varRes a]

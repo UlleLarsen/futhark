@@ -45,13 +45,11 @@ entry fwd_J [n][m][k] (input: [n][m][k]f32) =
   tabulate_3d n m k (\i j q -> jvp primal input 
   (replicate n (replicate m (replicate k 0)) 
     with [i] = (replicate m (replicate k 0) 
-      with [j] = (replicate k 0 with [q] = 1))))
-    |> flatten_3d |> transpose |> map transpose |> unflatten_3d n m k
-    
+      with [j] = (replicate k 0 with [q] = 1))))  
 
 entry rev_J [n][m][k] (input: [n][m][k]f32) =
   let res = tabulate_3d n m k (\i j q -> vjp primal input 
     (replicate n (replicate m (replicate k 0)) 
       with [i] = (replicate m (replicate k 0) 
         with [j] = (replicate k 0 with [q] = 1)))) 
-  in res
+  in res |> transpose |> map transpose
