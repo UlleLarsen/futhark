@@ -8,6 +8,7 @@ import Futhark.IR.SOACS
 import Futhark.Tools
 import Futhark.Transform.Rename
 import Data.List (transpose)
+import Futhark.IR.SOACS.Simplify (simplifyLambda)
 
 data FirstOrSecond = WrtFirst | WrtSecond
 
@@ -33,8 +34,9 @@ identityM n t =
 --       `xs` is  the input  of scan
 --       `ys_adj` is the known adjoint of ys
 --       `j` draw values from `iota n`
-mkScanFusedMapLam :: VjpOps -> SubExp -> Lambda SOACS -> [VName] -> [VName] -> [VName] -> ADM (Lambda SOACS)
-mkScanFusedMapLam ops w scn_lam xs ys ys_adj = do
+mkScanFusedMapLam :: VjpOps -> SubExp -> Lambda SOACS -> [VName] -> [VName] -> 
+                       [VName] -> SpecialCase -> ADM (Lambda SOACS)
+mkScanFusedMapLam ops w scn_lam xs ys ys_adj sc = do
   ys_ts <- traverse lookupType ys
   idmat <- identityM (length ys) $ rowType $ head ys_ts
   lams <- traverse (mkScanAdjointLam ops scn_lam WrtFirst) idmat
@@ -46,7 +48,9 @@ mkScanFusedMapLam ops w scn_lam xs ys ys_adj = do
         (toExp $ le64 i .==. 0)
         ( buildBody_ $ do
             zs <- mapM (letSubExp "ct_zero" . zeroExp . rowType) ys_ts
-            pure $ subExpsRes $ zs  ++ concat idmat
+            let (z1,z2) = fun sc zs
+            let (id1,id2) = fun sc $ case_jac sc idmat
+            pure $ subExpsRes $ z1  ++ concat id1 ++ z2 ++ concat id2
         )
         ( buildBody_ $ do
             j <- letSubExp "j" =<< toExp (pe64 w - (le64 i + 1))
@@ -56,9 +60,27 @@ mkScanFusedMapLam ops w scn_lam xs ys ys_adj = do
               letSubExp (baseString y_ ++ "_j") $ index j y_ t
             let args = map pure $ zipWith (index j) ys ys_ts ++ zipWith (index j1) xs ys_ts
             lam_rs <- traverse (`eLambda` args) lams
+            
+            let (y1,y2) = fun sc $ subExpsRes y_s
+            let (id1,id2) = fun sc $ case_jac sc $ transpose lam_rs
 
-            pure $ subExpsRes y_s ++ concat (transpose lam_rs)
+            pure $ y1 ++ concat id1 ++ y2 ++ concat id2
         )
+  where
+    fun ZeroQuadrant lst =
+      splitAt (div (length lst) 2) lst
+    fun _ lst = (lst,[])
+
+case_jac :: SpecialCase -> [[a]] -> [[a]]
+case_jac Generic jac = jac
+case_jac ZeroQuadrant jac = 
+  let half = div (length jac) 2
+      h1 = take half <$> take half jac
+      h2 = drop half <$> drop half jac
+  in h1 ++ h2
+case_jac MatrixMul jac =
+  let half = div (length jac) 2
+  in take half <$> take half jac
 
 splitEvery :: Int -> [a] -> [[a]]
 splitEvery _ [] = []
@@ -83,37 +105,70 @@ vectorAdd :: [PrimExp VName] -> [PrimExp VName] -> [PrimExp VName]
 vectorAdd = zipWith (~+~)
 
 -- \(a1, b1) (a2, b2) -> (a2 + b2 * a1, b2 * b1)
-mkScanLinFunO :: Type -> Int -> ADM (Scan SOACS)
-mkScanLinFunO t d = do
+mkScanLinFunO :: Type -> Int -> SpecialCase -> ADM (Scan SOACS)
+mkScanLinFunO t d sc = do
   let pt = elemType t
-  zeros <- replicateM d $ letSubExp "zeros" $ zeroExp $ rowType t
-  idmat <- identityM d $ Prim pt
-  a1s <- replicateM d $ newVName "a1"
-  b1s <- replicateM (d*d) $ newVName "b1"
-  a2s <- replicateM d $ newVName "a2"
-  b2s <- replicateM (d*d) $ newVName "b2"
+  neu_elm <- neutral sc
+  (a1s,b1s,a2s,b2s) <- caseParams sc
   let pet = primExpFromSubExp pt . Var
+
   lam <- mkLambda (map (\v -> Param mempty v (rowType t)) (a1s ++ b1s ++ a2s ++ b2s)) . fmap subExpsRes $ do
     let [a1s',b1s',a2s',b2s'] = (fmap . fmap) pet [a1s,b1s,a2s,b2s]
-    let x1 = matrixVecMul b2s' a1s' d pt
+    let x1 = case sc of
+              MatrixMul -> 
+                 let h1 = matrixVecMul b2s' (take (div d 2) a1s') (div d 2) pt
+                     h2 = matrixVecMul b2s' (drop (div d 2) a1s') (div d 2) pt
+                 in h1 ++ h2
+              _ -> matrixVecMul b2s' a1s' d pt
     let x2 = a2s' `vectorAdd` x1
-    let x3 = matrixMul b2s' b1s' d pt
+    let x3 = case sc of
+              Generic -> matrixMul b2s' b1s' d pt
+              _ -> matrixMul b2s' b1s' (div d 2) pt
     traverse (letSubExp "r" <=< toExp) $ x2 ++ x3
 
-  return $ Scan lam $ zeros ++ concat idmat
+  return $ Scan lam neu_elm
+  where
+    neutral Generic = 
+      neu d d
+    neutral ZeroQuadrant = 
+      neu (div d 2) $ div d 2
+    neutral MatrixMul =
+      neu d $ div d 2
+    
+    neu a b = do
+      zeros <- replicateM a $ letSubExp "zeros" $ zeroExp $ rowType t
+      idmat <- identityM b $ Prim $ elemType t
+      pure $ zeros ++ concat idmat
+
+    caseParams Generic =
+      params d $ d*d
+    caseParams ZeroQuadrant = 
+      params (div d 2) (div (d*d) 4)
+    caseParams MatrixMul =
+      params d (div (d*d) 4)
+    
+    params a b = do
+      a1s <- replicateM a $ newVName "a1"
+      b1s <- replicateM b $ newVName "b1"
+      a2s <- replicateM a $ newVName "a2"
+      b2s <- replicateM b $ newVName "b2"
+      pure (a1s,b1s,a2s,b2s)
+
 
 -- build the map following the scan with linear-function-composition:
 -- for each (ds,cs) length-n array results of the scan, combine them as:
 --    `let rs = map2 (\ d_i c_i -> d_i + c_i * y_adj[n-1]) d c |> reverse`
 -- but insert explicit indexing to reverse inside the map.
-mkScan2ndMaps :: SubExp -> Int -> (Type, [VName], ([VName], [VName])) -> ADM [VName]
-mkScan2ndMaps w d (arr_tp, y_adj, (ds, cs)) = do
+mkScan2ndMaps :: SubExp -> Int -> (Type, [VName], ([VName], [VName])) -> SpecialCase -> ADM [VName]
+mkScan2ndMaps w d (arr_tp, y_adj, (ds, cs)) sc = do
+  let pt = elemType arr_tp
+
   nm1 <- letSubExp "nm1" =<< toExp (pe64 w - 1)
   y_adj_last <-
     traverse (\adj ->
       letExp (baseString adj ++ "_last") $
         BasicOp $ Index adj $ fullSlice arr_tp [DimFix nm1]) y_adj
-
+  
   par_i <- newParam "i" $ Prim int64
   lam <- mkLambda [par_i] $ do
     let i = paramName par_i
@@ -128,7 +183,16 @@ mkScan2ndMaps w d (arr_tp, y_adj, (ds, cs)) = do
     let pet = primExpFromSubExp (elemType arr_tp) . Var
     fmap subExpsRes $ do
       let [dj',cj',y_adj'] = (fmap . fmap) pet [dj, cj, y_adj_last]
-      let x1 = matrixVecMul cj' y_adj' d $ elemType arr_tp
+      let x1 = case sc of
+                MatrixMul -> 
+                  let h1 = matrixVecMul cj' (take (div d 2) y_adj') (div d 2) pt
+                      h2 = matrixVecMul cj' (drop (div d 2) y_adj') (div d 2) pt
+                  in h1 ++ h2
+                ZeroQuadrant ->
+                  let h1 = matrixVecMul (take (div d 2) cj') (take (div d 2) y_adj') (div d 2) pt
+                      h2 = matrixVecMul (drop (div d 2) cj') (drop (div d 2) y_adj') (div d 2) pt
+                  in h1 ++ h2
+                _ -> matrixVecMul cj' y_adj' d pt
       let x2 = dj' `vectorAdd` x1
       traverse (letSubExp "r" <=< toExp) x2
 
@@ -169,21 +233,82 @@ mkScanFinalMap ops w scan_lam xs ys rs = do
   iota <- letExp "iota" $ BasicOp $ Iota w (intConst Int64 0) (intConst Int64 1) Int64
   letTupExp "scan_contribs" $ Op (Screma w (iota : xs ++ rs) (ScremaForm [] [] map_lam))
 
+data SpecialCase =
+   Generic
+ | ZeroQuadrant
+ | MatrixMul
+ deriving (Show, Eq)
+
+cases :: Int -> Type -> [[Exp SOACS]] -> SpecialCase
+cases d t mat 
+  | even d =
+  let half = div d 2
+      h1 = drop half <$> take half mat
+      h2 = take half <$> drop half mat
+      zero = zeroExp t
+  in if all (zero ==) (concat (h1 ++ h2)) 
+    then 
+      let h2' = drop half <$> drop half mat
+          h1' = take half <$> take half mat
+      in if h1' == h2' 
+        then MatrixMul
+        else ZeroQuadrant
+    else Generic
+cases _ _ _ = Generic
+
+identifyCase :: VjpOps -> Lambda SOACS -> ADM SpecialCase
+identifyCase ops lam = do
+  let t = lambdaReturnType lam
+  let d = length t
+  idmat <- identityM d $ head t
+  lams <- traverse (mkScanAdjointLam ops lam WrtFirst) idmat
+
+  par1 <- traverse (newParam "tmp1") t
+  par2 <- traverse (newParam "tmp2") t
+  jac_lam <- mkLambda (par1 ++ par2) $ do
+    let args = fmap eParam $ par1 ++ par2
+    lam_rs <- traverse (`eLambda` args) lams
+
+    pure $ concat (transpose lam_rs)
+
+  simp <- simplifyLambda jac_lam
+  let jac = splitEvery d $ fmap (BasicOp . SubExp . resSubExp) $ bodyResult $ lambdaBody simp
+  pure $ cases d (head t) jac
+
 diffScan :: VjpOps -> [VName] -> SubExp -> [VName] -> Scan SOACS -> ADM ()
 diffScan ops ys w as scan = do
+  sc <- identifyCase ops (scanLambda scan)
   let d = length as
   ys_adj <- mapM lookupAdjVal ys
   as_ts <- mapM lookupType as
-  map1_lam <- mkScanFusedMapLam ops w (scanLambda scan) as ys ys_adj
-  scans_lin_fun_o <- mkScanLinFunO (head as_ts) d
+  map1_lam <- mkScanFusedMapLam ops w (scanLambda scan) as ys ys_adj sc
+  scans_lin_fun_o <- mkScanLinFunO (head as_ts) d sc
+  scan_lams <- caseScan sc scans_lin_fun_o
   iota <-
     letExp "iota" $ BasicOp $ Iota w (intConst Int64 0) (intConst Int64 1) Int64
   r_scan <-
     letTupExp "adj_ctrb_scan" $
-      Op (Screma w [iota] (ScremaForm [scans_lin_fun_o] [] map1_lam))
-  red_nms <- mkScan2ndMaps w d (head as_ts, ys_adj, splitAt d r_scan)
+      Op (Screma w [iota] (ScremaForm scan_lams [] map1_lam))
+  red_nms <- mkScan2ndMaps w d (head as_ts, ys_adj, splitScanRes sc r_scan d) sc
+  
   as_contribs <- mkScanFinalMap ops w (scanLambda scan) as ys red_nms
   zipWithM_ updateAdj as as_contribs
+  where
+    caseScan :: SpecialCase -> Scan SOACS -> ADM [Scan SOACS]
+    caseScan ZeroQuadrant fun = do
+      fun' <- renameLambda $ scanLambda fun
+      pure [fun, Scan fun' $ scanNeutral fun]
+    caseScan _ fun = do
+      pure [fun]
+    
+    splitScanRes ZeroQuadrant res d =
+      let (d1,rest1) = splitAt (div d 2) res
+          (c1,rest2) = splitAt (div (d*d) 4) rest1
+          (d2,rest3) = splitAt (div d 2) rest2
+          (c2,[]) = splitAt (div (d*d) 4) rest3
+      in (d1++d2, c1++c2)
+    splitScanRes _ res d =
+      splitAt d res
 
 diffScanVec :: VjpOps -> [VName] -> StmAux () -> SubExp -> Lambda SOACS ->
                  [SubExp] -> [VName] -> ADM () -> ADM ()
@@ -223,14 +348,14 @@ diffScanAdd _ops ys n lam' ne as = do
 
   map_scan <- rev_arr_lam ys_bar
 
-  iota <- letExp "iota" $ 
+  iota <- letExp "iota" $
     BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
 
-  scan_res <- letExp "res_rev" $ 
+  scan_res <- letExp "res_rev" $
     Op $ Screma n [iota] $ ScremaForm [Scan lam [ne]] [] map_scan
-  
+
   rev_lam <- rev_arr_lam scan_res
-  contrb <- letExp "contrb" $ 
+  contrb <- letExp "contrb" $
     Op $ Screma n [iota] $ mapSOAC rev_lam
 
   updateAdj as contrb
@@ -240,8 +365,8 @@ diffScanAdd _ops ys n lam' ne as = do
       t <- lookupType arr
       par_i <- newParam "i" $ Prim int64
       mkLambda [par_i] $ do
-        nmim1 <- letSubExp "nmim1" =<< 
+        nmim1 <- letSubExp "nmim1" =<<
           toExp (pe64 n - le64 (paramName par_i) - 1)
-        a <- letExp "ys_bar_rev" $ 
+        a <- letExp "ys_bar_rev" $
           BasicOp $ Index arr $ fullSlice t [DimFix nmim1]
         pure [varRes a]
