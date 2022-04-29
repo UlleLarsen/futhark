@@ -1,4 +1,5 @@
 -- Scan with nested map
+-- vectorised special case, generic case
 -- ==
 -- entry: fwd_J rev_J
 -- compiled input { [[[1f32,2f32], [2f32,3f32]], [[4f32,5f32], [3f32,4f32]], 
@@ -37,7 +38,6 @@
 --   [[[0f32, 0f32], [0f32, 0f32]], [[0f32, 0f32], [0f32, 0f32]], 
 --    [[0f32, 0f32], [0f32, 0f32]], [[0f32, 0f32], [0f32, 60f32]]]]]]
 -- }
--- vectorised special case, generic case
 
 def primal [n][m][k] (xs: [n][m][k]f32) =
   scan (map2 (map2 (*))) (replicate m (replicate k 1)) xs

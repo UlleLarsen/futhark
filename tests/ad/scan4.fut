@@ -1,4 +1,5 @@
 -- Scan with tuple operator.
+-- ZeroQuadrant case
 -- ==
 -- entry: fwd_J rev_J
 -- compiled input { [[1.0f32, 2.0f32], [4.0f32, 3.0f32], [3.0f32, 4.0f32], [4.0f32, 2.0f32]] }
@@ -8,7 +9,6 @@
 --  [[1f32, 12f32], [1f32, 8f32],  [1f32, 6f32],  [0f32, 0f32]],
 --  [[1f32, 24f32], [1f32, 16f32], [1f32, 12f32], [1f32, 24f32]]]
 -- }
--- ZeroQuadrant case
 
 def primal [n] (xs: [n](f32,f32)) =
   scan (\(a1,b1) (a2,b2) -> (a1+a2, b1*b2)) (0,1) xs

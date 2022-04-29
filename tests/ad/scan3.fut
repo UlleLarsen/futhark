@@ -1,4 +1,5 @@
 -- Scan with 2x2 matrix multiplication.
+-- MatrixMul case
 -- ==
 -- entry: fwd_J rev_J
 -- compiled input { [[1f32,2f32,3f32,4f32], [4f32,3f32,2f32,1f32], [1f32,2f32,3f32,4f32], [4f32,3f32,2f32,1f32]] }
@@ -20,7 +21,6 @@
 --   [[0f32, 0f32, 92f32, 36f32], [24f32, 60f32, 32f32, 80f32], [80f32, 40f32, 52f32, 26f32], [59f32, 0f32, 92f32, 0f32]],
 --   [[0f32, 0f32, 59f32, 23f32], [15f32, 39f32, 20f32, 52f32], [60f32, 20f32, 39f32, 13f32], [0f32, 59f32, 0f32, 92f32]]]]
 -- }
--- MatrixMul case
 
 def mm2by2  (a1: f32, b1: f32, c1: f32, d1: f32)
             (a2: f32, b2: f32, c2: f32, d2: f32) =

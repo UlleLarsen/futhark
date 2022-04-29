@@ -1,4 +1,5 @@
 -- Scan with linear function composition.
+-- MatrixMul case
 -- ==
 -- entry: fwd_J rev_J
 -- compiled input { [[1f32, 2f32], [4f32, 3f32], [3f32, 4f32], [4f32, 2f32]] }
@@ -12,7 +13,6 @@
 --  [[[24f32, 0f32], [8f32, 8f32], [2f32, 14f32], [1f32, 31f32]], 
 --   [[0f32, 24f32], [0f32, 16f32], [0f32, 12f32], [0f32, 24f32]]]]
 -- }
--- MatrixMul case
 
 def primal [n] (xs: [n](f32,f32)) =
   scan (\(a1,b1) (a2,b2) -> (a2 + b2*a1, b1*b2)) (0,1) xs

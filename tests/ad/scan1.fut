@@ -1,4 +1,5 @@
 -- Scan with addition.
+-- addition special case
 -- ==
 -- entry: fwd_J rev_J
 -- compiled input { [1.0f32, 2.0f32, 3.0f32, 4.0f32, 5.0f32] }
@@ -8,7 +9,6 @@
 --           [1.0f32, 1.0f32, 1.0f32, 1.0f32, 0.0f32],
 --           [1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32]]
 --        }
--- addition special case
 
 entry fwd_J [n] (a: [n]f32) =
   tabulate n (\i -> jvp (scan (+) 0) a (replicate n 0 with [i] = 1))
