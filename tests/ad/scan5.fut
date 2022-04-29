@@ -9,6 +9,7 @@
 --   [[24f32, 24f32], [12f32, 12f32], [8f32, 8f32], [6f32, 6f32], [0f32, 0f32]],
 --   [[120f32, 120f32], [60f32, 60f32], [40f32, 40f32], [30f32, 30f32], [24f32, 24f32]]]
 -- }
+-- Vectorised special case + generic case
 
 def primal [n][k] (a: [n][k]f32) =
   scan (map2 (*)) (replicate k 1) a

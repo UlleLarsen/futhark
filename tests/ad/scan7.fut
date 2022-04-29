@@ -37,6 +37,7 @@
 --   [[[0f32, 0f32], [0f32, 0f32]], [[0f32, 0f32], [0f32, 0f32]], 
 --    [[0f32, 0f32], [0f32, 0f32]], [[0f32, 0f32], [0f32, 60f32]]]]]]
 -- }
+-- vectorised special case, generic case
 
 def primal [n][m][k] (xs: [n][m][k]f32) =
   scan (map2 (map2 (*))) (replicate m (replicate k 1)) xs
@@ -48,8 +49,11 @@ entry fwd_J [n][m][k] (input: [n][m][k]f32) =
       with [j] = (replicate k 0 with [q] = 1))))  
 
 entry rev_J [n][m][k] (input: [n][m][k]f32) =
-  let res = tabulate_3d n m k (\i j q -> vjp primal input 
-    (replicate n (replicate m (replicate k 0)) 
+  let res = tabulate_3d n m k (\i j q -> vjp primal input
+   (replicate n (replicate m (replicate k 0))
       with [i] = (replicate m (replicate k 0) 
         with [j] = (replicate k 0 with [q] = 1)))) 
-  in res |> transpose |> map transpose
+  let a = res |> map (map transpose) |> map (map (map transpose)) |> map (map (map (map transpose)))
+  let a2 = a |> map transpose |> map (map transpose) |> map (map (map transpose))
+  in a2 |> transpose |> map transpose |> (map (map transpose))
+     

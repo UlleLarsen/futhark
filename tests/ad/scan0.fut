@@ -8,6 +8,7 @@
 --           [24.0f32, 12.0f32, 8.0f32, 6.0f32, 0.0f32],
 --           [120.0f32, 60.0f32, 40.0f32, 30.0f32, 24.0f32]]
 --        }
+-- generic case
 
 entry fwd_J [n] (a: [n]f32) =
   tabulate n (\i -> jvp (scan (*) 1) a (replicate n 0 with [i] = 1))

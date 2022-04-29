@@ -8,6 +8,7 @@
 --           [1.0f32, 1.0f32, 1.0f32, 1.0f32, 0.0f32],
 --           [1.0f32, 1.0f32, 1.0f32, 1.0f32, 1.0f32]]
 --        }
+-- addition special case
 
 entry fwd_J [n] (a: [n]f32) =
   tabulate n (\i -> jvp (scan (+) 0) a (replicate n 0 with [i] = 1))
