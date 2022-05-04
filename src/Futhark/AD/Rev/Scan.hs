@@ -59,9 +59,10 @@ mkScanAdjointLam ops lam0 which adjs = do
 --       `ys_adj` is the known adjoint of ys
 --       `j` draw values from `iota n`
 mkScanFusedMapLam :: VjpOps -> SubExp -> Lambda SOACS -> [VName] -> [VName] ->
-                       [VName] -> Special -> ADM (Lambda SOACS)
-mkScanFusedMapLam ops w scn_lam xs ys ys_adj s = do
+                       [VName] -> Special -> Int -> ADM (Lambda SOACS)
+mkScanFusedMapLam ops w scn_lam xs ys ys_adj s d = do
   let sc = specialCase s
+  let k = specialSubSize s
   ys_ts <- traverse lookupType ys
   idmat <- identityM (length ys) $ rowType $ head ys_ts
   lams <- traverse (mkScanAdjointLam ops scn_lam WrtFirst) idmat
@@ -77,7 +78,7 @@ mkScanFusedMapLam ops w scn_lam xs ys ys_adj s = do
             y_s <- forM (zip ys_adj ys_ts) $ \(y_, t) ->
               letSubExp (baseString y_ ++ "_j") $ index j y_ t
             let zso = orderArgs s y_s
-            let ido = orderArgs s $ case_jac sc idmat
+            let ido = orderArgs s $ case_jac k sc idmat
             pure $ subExpsRes $ concat $ zipWith (++) zso $ fmap concat ido
         )
         ( buildBody_ $ do
@@ -91,36 +92,31 @@ mkScanFusedMapLam ops w scn_lam xs ys ys_adj s = do
             lam_rs <- traverse (`eLambda` args) lams
 
             let yso = orderArgs s $ subExpsRes y_s
-            let jaco = orderArgs s $ case_jac sc $ transpose lam_rs
+            let jaco = orderArgs s $ case_jac k sc $ transpose lam_rs
 
             pure $ concat $ zipWith (++) yso $ fmap concat jaco
         )
   where
-    case_jac :: SpecialCase -> [[a]] -> [[a]]
-    case_jac Generic jac = jac
-    case_jac ZeroQuadrant jac =
-      let half = div (length jac) 2
-          (top,bot) = splitAt half jac
-          h11 = take half <$> top
-          h22 = drop half <$> bot
-      in h11 ++ h22
-    case_jac MatrixMul jac =
-      let half = div (length jac) 2
-      in take half <$> take half jac
+    case_jac :: Int -> SpecialCase -> [[a]] -> [[a]]
+    case_jac _ Generic jac = jac
+    case_jac k ZeroQuadrant jac =
+      concat $ zipWith (\i -> 
+        map (take k . drop (i*k))) [0..d `div` k] $ splitEvery k jac
+    case_jac k MatrixMul jac =
+      take k <$> take k jac
 
 -- a1 a2 b -> a2 + b * a1
-linFunT0 :: [PrimExp VName] -> [PrimExp VName] -> [[PrimExp VName]] -> Special -> Int -> PrimType -> [PrimExp VName]
-linFunT0 a1 a2 b s d pt =
+linFunT0 :: [PrimExp VName] -> [PrimExp VName] -> [[PrimExp VName]] -> Special -> PrimType -> [PrimExp VName]
+linFunT0 a1 a2 b s pt =
   let t = case specialCase s of
             MatrixMul ->
-                let (h1,h2) = splitAt (div d 2) a1
-                in matrixVecMul b h1 pt ++ matrixVecMul b h2 pt
+              concatMap (\v -> matrixVecMul b v pt) $ splitEvery (specialSubSize s) a1
             _ -> matrixVecMul b a1 pt
     in a2 `vectorAdd` t
 
 -- \(a1, b1) (a2, b2) -> (a2 + b2 * a1, b2 * b1)
-mkScanLinFunO :: Type -> Int -> Special -> ADM (Scan SOACS)
-mkScanLinFunO t d s = do
+mkScanLinFunO :: Type -> Special -> ADM (Scan SOACS)
+mkScanLinFunO t s = do
   let pt = elemType t
   neu_elm <- mkNeutral $ specialNeutral s
   let (as,bs) = specialParams s
@@ -132,8 +128,9 @@ mkScanLinFunO t d s = do
     let [a1s',b1s',a2s',b2s'] = (fmap . fmap) pet [a1s,b1s,a2s,b2s]
     let (b1sm,b2sm) = (splitEvery n b1s',splitEvery n b2s')
 
-    let t0 = linFunT0 a1s' a2s' b2sm s d pt
+    let t0 = linFunT0 a1s' a2s' b2sm s pt
     let t1 = concat $ matrixMul b2sm b1sm pt
+    --error $ show d ++ " " ++ show (length t0) ++ " " ++ show (length t1) ++ " " ++ show (fmap length [a1s', a2s', concat b2sm])
     traverse (letSubExp "r" <=< toExp) $ t0 ++ t1
 
   return $ Scan lam neu_elm
@@ -215,26 +212,33 @@ data SpecialCase =
 data Special = Special
   { specialNeutral :: (Int,Int),
     specialParams :: (Int,Int),
+    specialScans :: Int,
+    specialSubSize :: Int,
     specialCase :: SpecialCase
   }
   deriving Show
 
-specialScans :: Special -> Int
-specialScans (Special _ _ ZeroQuadrant) = 2
-specialScans _ = 1
+subMats :: Int -> [[Exp SOACS]] -> Exp SOACS -> Maybe Int
+subMats d mat zero =
+  let sub_d = filter (\x -> d `mod` x == 0) [1..(d `div` 2)]
+      poss =
+        map (\m ->
+                all (\(row, i) -> all (\(v, j) -> v==zero || (i `div` m == j `div` m)
+                                      ) $ zip row [0..d-1]
+                    ) $ zip mat [0..d-1]
+            ) sub_d
+      tmp = filter fst (zip poss sub_d)
+  in if null tmp then Nothing else Just $ snd $ head tmp
 
 cases :: Int -> Type -> [[Exp SOACS]] -> Special
 cases d t mat
-  | even d,
-    half <- div d 2,
-    (top,bot) <- splitAt half $ splitAt half <$> mat,
-    (h11,h12) <- unzip top,
-    (h21,h22) <- unzip bot,
-    all (zeroExp t ==) (concat $ h12 ++ h21) =
-      if h11 == h22
-      then Special (d,half) (d,div (d*d) 4) MatrixMul
-      else Special (half,half) (half,div (d*d) 4) ZeroQuadrant
-cases d _ _ = Special (d,d) (d,d*d) Generic
+  | Just k <- subMats d mat $ zeroExp t =
+    let nonZeros = zipWith (\i -> map (take k . drop (i*k))) [0..d `div` k] $ splitEvery k mat
+    in if all (== head nonZeros) $ tail nonZeros then
+         Special (d,k) (d,k*k) 1 k MatrixMul
+       else
+         Special (k,k) (k,k*k) (d `div` k) k ZeroQuadrant
+cases d _ _ = Special (d,d) (d,d*d) 1 d Generic
 
 identifyCase :: VjpOps -> Lambda SOACS -> ADM Special
 identifyCase ops lam = do
@@ -261,8 +265,8 @@ diffScan ops ys w as scan = do
   let d = length as
   ys_adj <- mapM lookupAdjVal ys
   as_ts <- mapM lookupType as
-  map1_lam <- mkScanFusedMapLam ops w (scanLambda scan) as ys ys_adj sc
-  scans_lin_fun_o <- mkScanLinFunO (head as_ts) d sc
+  map1_lam <- mkScanFusedMapLam ops w (scanLambda scan) as ys ys_adj sc d
+  scans_lin_fun_o <- mkScanLinFunO (head as_ts) sc
   scan_lams <- mkScans (specialScans sc) scans_lin_fun_o
   iota <-
     letExp "iota" $ BasicOp $ Iota w (intConst Int64 0) (intConst Int64 1) Int64
