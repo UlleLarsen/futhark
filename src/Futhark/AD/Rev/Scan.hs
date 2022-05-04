@@ -53,7 +53,7 @@ mkScanAdjointLam ops lam0 which adjs = do
 
 -- Should generate something like:
 -- `\ j -> let i = n - 1 - j
---         if i < n-1 then ( ys_adj[i], df2dx ys[i] xs[i+1]) else (0,1) )`
+--         if i < n-1 then ( ys_adj[i], df2dx ys[i] xs[i+1]) else (ys_adj[i],1) )`
 -- where `ys` is  the result of scan
 --       `xs` is  the input  of scan
 --       `ys_adj` is the known adjoint of ys
@@ -72,8 +72,11 @@ mkScanFusedMapLam ops w scn_lam xs ys ys_adj s = do
       =<< eIf
         (toExp $ le64 i .==. 0)
         ( buildBody_ $ do
-            zs <- mapM (letSubExp "ct_zero" . zeroExp . rowType) ys_ts
-            let zso = orderArgs s zs
+            j <- letSubExp "j" =<< toExp (pe64 w - (le64 i + 1))
+            let index idx arr t = BasicOp $ Index arr $ fullSlice t [DimFix idx]
+            y_s <- forM (zip ys_adj ys_ts) $ \(y_, t) ->
+              letSubExp (baseString y_ ++ "_j") $ index j y_ t
+            let zso = orderArgs s y_s
             let ido = orderArgs s $ case_jac sc idmat
             pure $ subExpsRes $ concat $ zipWith (++) zso $ fmap concat ido
         )
@@ -150,38 +153,20 @@ mkScanLinFunO t d s = do
 
 -- build the map following the scan with linear-function-composition:
 -- for each (ds,cs) length-n array results of the scan, combine them as:
---    `let rs = map2 (\ d_i c_i -> d_i + c_i * y_adj[n-1]) d c |> reverse`
+--    `let rs = reverse d`
 -- but insert explicit indexing to reverse inside the map.
 mkScan2ndMaps :: SubExp -> Int -> (Type, [[VName]], [([VName], [VName])]) -> Special -> ADM [VName]
-mkScan2ndMaps w d (arr_tp, y_adjs, dscs) s = do
-  let pt = elemType arr_tp
-  let (_,n) = specialNeutral s
-
-  nm1 <- letSubExp "nm1" =<< toExp (pe64 w - 1)
-
+mkScan2ndMaps w _d (arr_tp, y_adjs, dscs) _s = do
   par_i <- newParam "i" $ Prim int64
-  lam <- mkLambda [par_i] $ concat <$> zipWithM (\y_adj (ds,cs) -> do
+  lam <- mkLambda [par_i] $ concat <$> zipWithM (\_y_adj (ds,_cs) -> do
     let i = paramName par_i
     j <- letSubExp "j" =<< toExp (pe64 w - (le64 i + 1))
-
-    y_adj_last <-
-      traverse (\adj ->
-        letExp (baseString adj ++ "_last") $
-          BasicOp $ Index adj $ fullSlice arr_tp [DimFix nm1]) y_adj
 
     dj <- traverse (\dd ->
       letExp (baseString dd ++ "_dj") $
         BasicOp $ Index dd $ fullSlice arr_tp [DimFix j]) ds
-    cj <- traverse (\c ->
-      letExp (baseString c ++ "_cj") $
-        BasicOp $ Index c $ fullSlice arr_tp [DimFix j]) cs
 
-    let pet = primExpFromSubExp (elemType arr_tp) . Var
-    fmap subExpsRes $ do
-      let [dj',cj',y_adj'] = (fmap . fmap) pet [dj, cj, y_adj_last]
-      let cjm = splitEvery n cj'
-      let t0 = linFunT0 y_adj' dj' cjm s d pt
-      traverse (letSubExp "r" <=< toExp) t0
+    pure $ varsRes dj
     ) y_adjs dscs
 
   iota <- letExp "iota" $ BasicOp $ Iota w (intConst Int64 0) (intConst Int64 1) Int64
