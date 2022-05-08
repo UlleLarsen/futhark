@@ -147,49 +147,32 @@ mkScanLinFunO t s = do
       b2s <- replicateM b $ newVName "b2"
       pure (a1s,b1s,a2s,b2s)
 
-
--- build the map following the scan with linear-function-composition:
--- for each (ds,cs) length-n array results of the scan, combine them as:
---    `let rs = reverse d`
--- but insert explicit indexing to reverse inside the map.
-mkScan2ndMaps :: SubExp -> Int -> (Type, [[VName]], [([VName], [VName])]) -> Special -> ADM [VName]
-mkScan2ndMaps w _d (arr_tp, y_adjs, dscs) _s = do
-  par_i <- newParam "i" $ Prim int64
-  lam <- mkLambda [par_i] $ concat <$> zipWithM (\_y_adj (ds,_cs) -> do
-    let i = paramName par_i
-    j <- letSubExp "j" =<< toExp (pe64 w - (le64 i + 1))
-
-    dj <- traverse (\dd ->
-      letExp (baseString dd ++ "_dj") $
-        BasicOp $ Index dd $ fullSlice arr_tp [DimFix j]) ds
-
-    pure $ varsRes dj
-    ) y_adjs dscs
-
-  iota <- letExp "iota" $ BasicOp $ Iota w (intConst Int64 0) (intConst Int64 1) Int64
-  letTupExp "after_scan" $ Op $ Screma w [iota] $ mapSOAC lam
-
--- perform the final map, which is fusable with the maps obtained from `mkScan2ndMaps`
+-- perform the final map
 -- let xs_contribs =
 --    map3 (\ i a r -> if i==0 then r else (df2dy (ys[i-1]) a) \bar{*} r)
---         (iota n) xs rs
-mkScanFinalMap :: VjpOps -> SubExp -> Lambda SOACS -> [VName] -> [VName] -> [VName] -> ADM [VName]
-mkScanFinalMap ops w scan_lam xs ys rs = do
+--         (iota n) xs (reverse ds)
+mkScanFinalMap :: VjpOps -> SubExp -> Lambda SOACS -> [VName] -> [VName] -> [VName] -> Type -> ADM [VName]
+mkScanFinalMap ops w scan_lam xs ys ds arr_tp = do
   let eltps = lambdaReturnType scan_lam
 
   par_i <- newParam "i" $ Prim int64
   let i = paramName par_i
   par_x <- zipWithM (\x -> newParam (baseString x ++ "_par_x")) xs eltps
-  par_r <- zipWithM (\r -> newParam (baseString r ++ "_par_r")) rs eltps
 
   map_lam <-
-    mkLambda (par_i : par_x ++ par_r) $
+    mkLambda (par_i : par_x) $ do
+      j <- letSubExp "j" =<< toExp (pe64 w - (le64 i + 1))
+
+      dj <- traverse (\dd ->
+        letExp (baseString dd ++ "_dj") $
+          BasicOp $ Index dd $ fullSlice arr_tp [DimFix j]) ds
+
       fmap varsRes . letTupExp "scan_contribs"
         =<< eIf
           (toExp $ le64 i .==. 0)
-          (resultBodyM $ map (Var . paramName) par_r)
+          (resultBodyM $ fmap Var dj)
           ( buildBody_ $ do
-              lam <- mkScanAdjointLam ops scan_lam WrtSecond $ fmap (Var . paramName) par_r
+              lam <- mkScanAdjointLam ops scan_lam WrtSecond $ fmap Var dj
 
               im1 <- letSubExp "im1" =<< toExp (le64 i - 1)
               ys_im1 <- forM ys $ \y -> do
@@ -201,7 +184,7 @@ mkScanFinalMap ops w scan_lam xs ys rs = do
           )
 
   iota <- letExp "iota" $ BasicOp $ Iota w (intConst Int64 0) (intConst Int64 1) Int64
-  letTupExp "scan_contribs" $ Op $ Screma w (iota : xs ++ rs) $ mapSOAC map_lam
+  letTupExp "scan_contribs" $ Op $ Screma w (iota : xs) $ mapSOAC map_lam
 
 data SpecialCase =
    Generic
@@ -273,9 +256,9 @@ diffScan ops ys w as scan = do
   r_scan <-
     letTupExp "adj_ctrb_scan" $
       Op $ Screma w [iota] $ ScremaForm scan_lams [] map1_lam
-  red_nms <- mkScan2ndMaps w d (head as_ts, orderArgs sc ys_adj, splitScanRes sc r_scan d) sc
+  -- red_nms <- mkScan2ndMaps w d (head as_ts, orderArgs sc ys_adj, splitScanRes sc r_scan d) sc
 
-  as_contribs <- mkScanFinalMap ops w (scanLambda scan) as ys red_nms
+  as_contribs <- mkScanFinalMap ops w (scanLambda scan) as ys (splitScanRes sc r_scan d) (head as_ts)
   zipWithM_ updateAdj as as_contribs
   where
     mkScans :: Int -> Scan SOACS -> ADM [Scan SOACS]
@@ -284,8 +267,10 @@ diffScan ops ys w as scan = do
         lam' <- renameLambda $ scanLambda s
         pure $ Scan lam' $ scanNeutral s
 
+    -- splitScanRes sc res d =
+    --   splitAt (div d $ specialScans sc) <$> orderArgs sc res
     splitScanRes sc res d =
-      splitAt (div d $ specialScans sc) <$> orderArgs sc res
+      concat $ take (div d $ specialScans sc) <$> orderArgs sc res
 
 diffScanVec :: VjpOps -> [VName] -> StmAux () -> SubExp -> Lambda SOACS ->
                  [SubExp] -> [VName] -> ADM () -> ADM ()
