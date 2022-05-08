@@ -122,8 +122,7 @@ vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just [Scan lam [ne]] <- isScanSOAC form, 
     [x] <- patNames pat,
     [a] <- as,
-    innerlam <- nestedMapOp lam,
-    Just [(op, _, _, _)] <- lamIsBinOp innerlam,
+    Just [(op, _, _, _)] <- lamIsBinOp lam,
     isAddOp op = do
       void $ commonSOAC pat aux soac m
       diffScanAdd ops x w lam ne a
