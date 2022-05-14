@@ -379,11 +379,16 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   i_param <- newParam "i" $ Prim int64
   a_param' <- newParam "a" $ rowType vs_type
   lam_vsbar <-
-    mkLambda [i_param, a_param'] $ do
-      let i = fullSlice vs_type [DimFix $ Var $ paramName i_param]
-      names <- traverse newVName ["zr_cts", "pr_bar", "nz_prd"]
-      zipWithM_ (\name -> letBindNames [name] . BasicOp . flip Index i) names [zr_counts, part_bar, nz_prods]
-      eLambda lam_vsbar_middle $ map (eSubExp . Var) names <> [eParam a_param']
+    mkLambda [i_param, a_param'] $
+      fmap varsRes . letTupExp "vs_bar" =<<
+        eIf
+          (toExp $ withinBounds $ pure (w, paramName i_param))
+          (buildBody_ $ do
+            let i = fullSlice vs_type [DimFix $ Var $ paramName i_param]
+            names <- traverse newVName ["zr_cts", "pr_bar", "nz_prd"]
+            zipWithM_ (\name -> letBindNames [name] . BasicOp . flip Index i) names [zr_counts, part_bar, nz_prods]
+            eLambda lam_vsbar_middle $ map (eSubExp . Var) names <> [eParam a_param'])
+          (eBody $ pure $ pure $ zeroExp $ rowType dst_type)
 
   vs_bar <-
     letExp (baseString vs <> "_bar") $ Op $ Screma n [is, vs] $ mapSOAC lam_vsbar
