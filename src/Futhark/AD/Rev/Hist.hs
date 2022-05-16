@@ -20,6 +20,13 @@ import Futhark.IR.SOACS
 import Futhark.Tools
 import Futhark.Transform.Rename
 
+letSubExps ::
+  MonadBuilder m =>
+  String ->
+  [Exp (Rep m)] ->
+  m [SubExp]
+letSubExps desc = mapM $ letSubExp desc
+
 getBinOpPlus :: PrimType -> BinOp
 getBinOpPlus (IntType x) = Add x OverflowUndef
 getBinOpPlus (FloatType f) = FAdd f

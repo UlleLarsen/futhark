@@ -12,6 +12,13 @@ import Futhark.IR.SOACS.Simplify (simplifyLambda)
 
 data FirstOrSecond = WrtFirst | WrtSecond
 
+letSubExps ::
+  MonadBuilder m =>
+  String ->
+  [Exp (Rep m)] ->
+  m [SubExp]
+letSubExps desc = mapM $ letSubExp desc
+
 splitEvery :: Int -> [a] -> [[a]]
 splitEvery _ [] = []
 splitEvery n list = first : splitEvery n rest
