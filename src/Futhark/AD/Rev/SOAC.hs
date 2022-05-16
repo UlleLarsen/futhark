@@ -107,14 +107,14 @@ vjpSOAC :: VjpOps -> Pat Type -> StmAux () -> SOAC SOACS -> ADM () -> ADM ()
 vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just reds <- isReduceSOAC form,
     length reds > 1 =
-    splitScanRed ops (reduceSOAC, redNeutral) (pat, aux, reds, w, as) m
+      splitScanRed ops (reduceSOAC, redNeutral) (pat, aux, reds, w, as) m
   | Just [red] <- isReduceSOAC form,
     [x] <- patNames pat,
     [ne] <- redNeutral red,
     [a] <- as,
     Just [(op, _, _, _)] <- lamIsBinOp $ redLambda red,
     isMinMaxOp op =
-    diffMinMaxReduce ops x aux w op ne a m
+      diffMinMaxReduce ops x aux w op ne a m
   | Just red <- singleReduce <$> isReduceSOAC form = do
     pat_adj <- mapM adjVal =<< commonSOAC pat aux soac m
     diffReduce ops pat_adj w as red
@@ -131,20 +131,20 @@ vjpSOAC ops pat aux soac@(Screma w as form) m
       diffScanVec ops (patNames pat) aux w op ne as m
   | Just scans <- isScanSOAC form,
     length scans > 1 =
-    splitScanRed ops (scanSOAC, scanNeutral) (pat, aux, scans, w, as) m
+      splitScanRed ops (scanSOAC, scanNeutral) (pat, aux, scans, w, as) m
   | Just red <- singleScan <$> isScanSOAC form = do
-    void $ commonSOAC pat aux soac m
-    diffScan ops (patNames pat) w as red
+      void $ commonSOAC pat aux soac m
+      diffScan ops (patNames pat) w as red
 vjpSOAC ops pat aux soac@(Screma w as form) m
   | Just lam <- isMapSOAC form = do
-    pat_adj <- commonSOAC pat aux soac m
-    vjpMap ops pat_adj w lam as
+      pat_adj <- commonSOAC pat aux soac m
+      vjpMap ops pat_adj aux w lam as
 vjpSOAC ops pat _aux (Screma w as form) m
   | Just (reds, map_lam) <-
       isRedomapSOAC form = do
-    (mapstm, redstm) <-
-      redomapToMapAndReduce pat (w, reds, map_lam, as)
-    vjpStm ops mapstm $ vjpStm ops redstm m
+      (mapstm, redstm) <-
+        redomapToMapAndReduce pat (w, reds, map_lam, as)
+      vjpStm ops mapstm $ vjpStm ops redstm m
 vjpSOAC ops pat aux (Scatter w lam ass written_info) m =
   vjpScatter ops pat aux (w, lam, ass, written_info) m
 vjpSOAC ops pat aux (Hist n as histops f) m
