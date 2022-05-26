@@ -171,6 +171,12 @@ diffMinMaxHist ::
   VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> VName -> SubExp -> SubExp -> VName -> ADM () -> ADM ()
 diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   let t = binOpType minmax
+  vs_type <- lookupType vs
+  let vs_dims = arrayDims vs_type
+  let vs_elm_type = elemType vs_type
+  dst_type <- lookupType dst
+  let dst_dims = arrayDims dst_type
+  let inner_dims = tail vs_dims
 
   dst_cpy <- letExp (baseString dst <> "_copy") $ BasicOp $ Copy dst
 
@@ -178,7 +184,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   acc_i_p <- newParam "acc_i" $ Prim int64
   v_p <- newParam "v" $ Prim t
   i_p <- newParam "i" $ Prim int64
-  hist_lam <-
+  hist_lam_inner <-
     mkLambda [acc_v_p, acc_i_p, v_p, i_p] $
       fmap varsRes . letTupExp "idx_res"
         =<< eIf
@@ -199,19 +205,34 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
                   (eBody [eParam v_p, eParam i_p])
               ]
           )
+  hist_lam <- nestedmap inner_dims [vs_elm_type,int64,vs_elm_type,int64] hist_lam_inner
 
-  minus_ones <-
+  dst_minus_ones <-
     letExp "minus_ones" $
-      BasicOp $ Replicate (Shape [w]) (intConst Int64 (-1))
+      BasicOp $ Replicate (Shape dst_dims) $ intConst Int64 (-1)
+  ne_minus_ones <-
+    letSubExp "minus_ones" $
+      BasicOp $ Replicate (Shape inner_dims) $ intConst Int64 (-1)
   iota_n <-
     letExp "red_iota" $
       BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
 
-  let hist_op = HistOp (Shape [w]) rf [dst_cpy, minus_ones] [ne, intConst Int64 (-1)] hist_lam
-  f' <- mkIdentityLambda [Prim int64, Prim t, Prim int64]
+  inp_iota <- do
+    if length vs_dims == 1
+    then pure iota_n
+    else do
+      i <- newParam "i" $ Prim int64
+      lam <- mkLambda [i] $
+        fmap varsRes . letTupExp "res" =<< do
+          pure $ BasicOp $ Replicate (Shape inner_dims) $ Var $ paramName i
+
+      letExp "res" $ Op $ Screma n [iota_n] $ mapSOAC lam
+
+  let hist_op = HistOp (Shape [w]) rf [dst_cpy, dst_minus_ones] [ne, if length vs_dims == 1 then intConst Int64 (-1) else ne_minus_ones] hist_lam
+  f' <- mkIdentityLambda [Prim int64, rowType vs_type, rowType $ Array int64 (Shape vs_dims) NoUniqueness]
   x_inds <- newVName (baseString x <> "_inds")
   auxing aux $
-    letBindNames [x, x_inds] $ Op $ Hist n [is, vs, iota_n] [hist_op] f'
+    letBindNames [x, x_inds] $ Op $ Hist n [is, vs, inp_iota] [hist_op] f'
 
   m
 
@@ -219,13 +240,14 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 
   x_ind_dst <- newParam (baseString x <> "_ind_param") $ Prim int64
   x_bar_dst <- newParam (baseString x <> "_bar_param") $ Prim t
-  dst_lam <-
+  dst_lam_inner <-
     mkLambda [x_ind_dst, x_bar_dst] $
       fmap varsRes . letTupExp "dst_bar"
         =<< eIf
           (toExp $ le64 (paramName x_ind_dst) .==. -1)
           (eBody $ pure $ eParam x_bar_dst)
           (eBody $ pure $ eSubExp $ Constant $ blankPrimValue t)
+  dst_lam <- nestedmap inner_dims [int64, vs_elm_type] dst_lam_inner
 
   dst_bar <-
     letExp (baseString dst <> "_bar") $
@@ -239,7 +261,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   par_x_ind_vs <- newParam (baseString x <> "_ind_param") $ Prim int64
   let x_ind_vs = paramName par_x_ind_vs
   par_x_bar_vs <- newParam (baseString x <> "_bar_param") $ Prim t
-  vs_lam <-
+  vs_lam_inner <-
     mkLambda [par_x_ind_vs, par_x_bar_vs] $
       fmap varsRes . letTupExp "res"
         =<< eIf
@@ -251,17 +273,44 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
                  BasicOp $
                    Index vs_bar $ Slice [DimFix $ Var x_ind_vs]
              eBinOp (getBinOpPlus t) (eParam par_x_bar_vs) (eSubExp vs_bar_i))
+  vs_lam <- nestedmap inner_dims [int64, vs_elm_type] vs_lam_inner
 
   vs_bar_p <-
     letExp (baseString vs <> "_partial") $
       Op $
         Screma w [x_inds, x_bar] $ mapSOAC vs_lam
 
-  f'' <- mkIdentityLambda [Prim int64, Prim t]
+  q <- letSubExp "q" =<<
+    foldBinOp (Mul Int64 OverflowUndef) (intConst Int64 1) dst_dims
+
+  scatter_inps <- do
+    inds <- mk_indices inner_dims []
+    inds' <- traverse (letExp "inds" . BasicOp . Replicate (Shape [w]) . Var) inds
+    traverse (letExp "flat" . BasicOp . Reshape [DimNew q]) $ x_inds : inds' ++ [vs_bar_p]
+
+  f'' <- mkIdentityLambda $ replicate (length dst_dims) (Prim int64) ++ [Prim t]
   vs_bar' <-
     letExp (baseString vs <> "_bar") $ Op $
-      Scatter w [x_inds, vs_bar_p] f'' [(Shape [n], 1, vs_bar)]
+      Scatter q scatter_inps f'' [(Shape vs_dims, 1, vs_bar)]
   insAdj vs vs_bar'
+
+  where
+    mk_indices :: [SubExp] -> [SubExp] -> ADM [VName]
+    mk_indices [] _ = pure []
+    mk_indices [d] iotas = do
+      reps <- traverse (letExp "rep" . BasicOp . Replicate (Shape [d])) iotas
+      iota_d <- letExp "red_iota" $
+        BasicOp $ Iota d (intConst Int64 0) (intConst Int64 1) Int64
+      pure $ reps ++ [iota_d]
+    mk_indices (d:dims) iotas = do
+      iota_d <- letExp "red_iota" $
+        BasicOp $ Iota d (intConst Int64 0) (intConst Int64 1) Int64
+
+      i_param <- newParam "i" $ Prim int64
+      lam <- mkLambda [i_param] $ 
+        fmap varsRes $ mk_indices dims $ iotas ++ [Var $ paramName i_param]
+
+      letTupExp "res" $ Op $ Screma d [iota_d] $ mapSOAC lam
 
 --
 -- special case of histogram with multiplication as operator.
@@ -298,6 +347,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   let vs_elm_type = elemType vs_type
   dst_type <- lookupType dst
   let dst_dims = arrayDims dst_type
+  let inner_dims = tail vs_dims
 
   v_param <- newParam "v" $ Prim t
   lam_ps_zs_inner <-
@@ -313,15 +363,15 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
   let [ps, zs] = ps_zs
 
   lam_mul_inner <- binOpLambda mul t
-  lam_mul <- nestedmap (tail vs_dims) [vs_elm_type, vs_elm_type] lam_mul_inner
+  lam_mul <- nestedmap inner_dims [vs_elm_type, vs_elm_type] lam_mul_inner
   nz_prods0 <- letExp "nz_prd" $ BasicOp $ Replicate (Shape [w]) ne
   let hist_nzp = HistOp (Shape [w]) rf [nz_prods0] [ne] lam_mul
 
   lam_add_inner <- binOpLambda (Add Int64 OverflowUndef) int64
-  lam_add <- nestedmap (tail vs_dims) [int64, int64] lam_add_inner
+  lam_add <- nestedmap inner_dims [int64, int64] lam_add_inner
   zr_counts0 <- letExp "zr_cts" $ BasicOp $ Replicate (Shape dst_dims) (intConst Int64 0)
-  zrn_ne <- letExp "zr_ne" $ BasicOp $ Replicate (Shape $ tail vs_dims) (intConst Int64 0)
-  let hist_zrn = HistOp (Shape [w]) rf [zr_counts0] [if length vs_dims == 1 then intConst Int64 0 else Var zrn_ne] lam_add
+  zrn_ne <- letSubExp "zr_ne" $ BasicOp $ Replicate (Shape inner_dims) (intConst Int64 0)
+  let hist_zrn = HistOp (Shape [w]) rf [zr_counts0] [if length vs_dims == 1 then intConst Int64 0 else zrn_ne] lam_add
 
   f' <- mkIdentityLambda [Prim int64, Prim int64, rowType vs_type, rowType $ Array int64 (Shape vs_dims) NoUniqueness]
   nz_prods <- newVName "non_zero_prod"
@@ -381,7 +431,7 @@ diffMulHist _ops x aux n mul ne is vs w rf dst m = do
               (eBody $ pure $ eSubExp $ Constant $ blankPrimValue t)
           )
 
-  lam_vsbar_middle <- nestedmap (tail vs_dims) [int64, t, t, t] lam_vsbar_inner
+  lam_vsbar_middle <- nestedmap inner_dims [int64, t, t, t] lam_vsbar_inner
 
   i_param <- newParam "i" $ Prim int64
   a_param' <- newParam "a" $ rowType vs_type

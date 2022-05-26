@@ -156,7 +156,8 @@ vjpSOAC ops pat aux (Hist n [is,vs] [histop] f) m
   | isIdentityLambda f,
     [x] <- patNames pat,
     HistOp (Shape [w]) rf [dst] [ne] lam <- histop,
-    Just [(op, _, _, _)] <- lamIsBinOp lam,
+    lam' <- nestedMapOp lam,
+    Just [(op, _, _, _)] <- lamIsBinOp lam',
     isMinMaxOp op =
     diffMinMaxHist ops x aux n op ne is vs w rf dst m
   | isIdentityLambda f,
