@@ -177,6 +177,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
   dst_type <- lookupType dst
   let dst_dims = arrayDims dst_type
   let inner_dims = tail vs_dims
+  let nr_dims = length vs_dims
 
   dst_cpy <- letExp (baseString dst <> "_copy") $ BasicOp $ Copy dst
 
@@ -218,7 +219,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
       BasicOp $ Iota n (intConst Int64 0) (intConst Int64 1) Int64
 
   inp_iota <- do
-    if length vs_dims == 1
+    if nr_dims == 1
     then pure iota_n
     else do
       i <- newParam "i" $ Prim int64
@@ -228,7 +229,7 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 
       letExp "res" $ Op $ Screma n [iota_n] $ mapSOAC lam
 
-  let hist_op = HistOp (Shape [w]) rf [dst_cpy, dst_minus_ones] [ne, if length vs_dims == 1 then intConst Int64 (-1) else ne_minus_ones] hist_lam
+  let hist_op = HistOp (Shape [w]) rf [dst_cpy, dst_minus_ones] [ne, if nr_dims == 1 then intConst Int64 (-1) else ne_minus_ones] hist_lam
   f' <- mkIdentityLambda [Prim int64, rowType vs_type, rowType $ Array int64 (Shape vs_dims) NoUniqueness]
   x_inds <- newVName (baseString x <> "_inds")
   auxing aux $
@@ -258,37 +259,38 @@ diffMinMaxHist _ops x aux n minmax ne is vs w rf dst m = do
 
   vs_bar <- lookupAdjVal vs
 
-  par_x_ind_vs <- newParam (baseString x <> "_ind_param") $ Prim int64
-  let x_ind_vs = paramName par_x_ind_vs
+  inds' <- traverse (letExp "inds" . BasicOp . Replicate (Shape [w]) . Var) =<< mk_indices inner_dims []
+  let inds = x_inds : inds'
+
+  par_x_ind_vs <- replicateM nr_dims $ newParam (baseString x <> "_ind_param") $ Prim int64
   par_x_bar_vs <- newParam (baseString x <> "_bar_param") $ Prim t
   vs_lam_inner <-
-    mkLambda [par_x_ind_vs, par_x_bar_vs] $
+    mkLambda (par_x_bar_vs : par_x_ind_vs) $
       fmap varsRes . letTupExp "res"
         =<< eIf
-          (toExp $ le64 x_ind_vs .==. -1)
+          (toExp $ le64 (paramName $ head par_x_ind_vs) .==. -1)
           (eBody $ pure $ eSubExp $ Constant $ blankPrimValue t)
           (eBody $ pure $ do
              vs_bar_i <-
                letSubExp (baseString vs_bar <> "_el") $
                  BasicOp $
-                   Index vs_bar $ Slice [DimFix $ Var x_ind_vs]
+                   Index vs_bar $ Slice $
+                    fmap (DimFix . Var . paramName) par_x_ind_vs
              eBinOp (getBinOpPlus t) (eParam par_x_bar_vs) (eSubExp vs_bar_i))
-  vs_lam <- nestedmap inner_dims [int64, vs_elm_type] vs_lam_inner
+  vs_lam <- nestedmap inner_dims (vs_elm_type : replicate nr_dims int64) vs_lam_inner
 
   vs_bar_p <-
     letExp (baseString vs <> "_partial") $
       Op $
-        Screma w [x_inds, x_bar] $ mapSOAC vs_lam
+        Screma w (x_bar : inds) $ mapSOAC vs_lam
 
   q <- letSubExp "q" =<<
     foldBinOp (Mul Int64 OverflowUndef) (intConst Int64 1) dst_dims
 
   scatter_inps <- do
-    inds <- mk_indices inner_dims []
-    inds' <- traverse (letExp "inds" . BasicOp . Replicate (Shape [w]) . Var) inds
-    traverse (letExp "flat" . BasicOp . Reshape [DimNew q]) $ x_inds : inds' ++ [vs_bar_p]
+    traverse (letExp "flat" . BasicOp . Reshape [DimNew q]) $ inds ++ [vs_bar_p]
 
-  f'' <- mkIdentityLambda $ replicate (length dst_dims) (Prim int64) ++ [Prim t]
+  f'' <- mkIdentityLambda $ replicate nr_dims (Prim int64) ++ [Prim t]
   vs_bar' <-
     letExp (baseString vs <> "_bar") $ Op $
       Scatter q scatter_inps f'' [(Shape vs_dims, 1, vs_bar)]
