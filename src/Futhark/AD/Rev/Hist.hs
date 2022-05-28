@@ -69,43 +69,38 @@ nestedmap s@(h : r) pt lam = do
         Op $ Screma h (map paramName params) $ mapSOAC body
 
 -- \ds hs -> map2 lam ds hs
-mkF' :: Lambda SOACS -> [Type] -> SubExp -> ADM ([VName], Lambda SOACS)
+mkF' :: Lambda SOACS -> [Type] -> SubExp -> ADM ([VName],[VName], Lambda SOACS)
 mkF' lam tps n = do
   lam' <- renameLambda lam
 
   ds_params <- traverse (newParam "ds_param") tps
   hs_params <- traverse (newParam "hs_param") tps
-  let map_params = ds_params <> hs_params
-  lam_map <- mkLambda map_params $
+  let ds_pars = fmap paramName ds_params
+  let hs_pars = fmap paramName hs_params
+  lam_map <- mkLambda (ds_params <> hs_params) $
     fmap varsRes . letTupExp "map_f'" $
-      Op $ Screma n (map paramName map_params) $ mapSOAC lam'
+      Op $ Screma n (ds_pars <> hs_pars) $ mapSOAC lam'
 
-  pure (map paramName ds_params, lam_map)
+  pure (ds_pars, hs_pars, lam_map)
 
--- \ds ls as rs -> map4 (\di li ai ri -> di `lam` li `lam` ai `lam` ri) ds ls as rs
+-- \ls as rs -> map3 (\li ai ri -> li `lam` ai `lam` ri) ls as rs
 mkF :: Lambda SOACS -> [Type] -> SubExp -> ADM ([VName], Lambda SOACS)
 mkF lam tps n = do
   lam_l <- renameLambda lam
   lam_r <- renameLambda lam
-  lam_d <- renameLambda lam
   let q = length $ lambdaReturnType lam
-      (dps, lps) = splitAt q $ lambdaParams lam_l
-      (ips, aps) = splitAt q $ lambdaParams lam_r
-      (jps, rps) = splitAt q $ lambdaParams lam_d
-  lam' <- mkLambda (dps <> lps <> aps <> rps) $ do
+      (lps, aps) = splitAt q $ lambdaParams lam_l
+      (ips, rps) = splitAt q $ lambdaParams lam_r
+  lam' <- mkLambda (lps <> aps <> rps) $ do
     lam_l_res <- bodyBind $ lambdaBody lam_l
     forM_ (zip ips lam_l_res) $ \(ip, SubExpRes cs se) ->
       certifying cs $ letBindNames [paramName ip] $ BasicOp $ SubExp se
-    lam_r_res <- bodyBind $ lambdaBody lam_r
-    forM_ (zip jps lam_r_res) $ \(ip, SubExpRes cs se) ->
-      certifying cs $ letBindNames [paramName ip] $ BasicOp $ SubExp se
-    bodyBind $ lambdaBody lam_d
+    bodyBind $ lambdaBody lam_r
 
   ls_params <- traverse (newParam "ls_param") tps
   as_params <- traverse (newParam "as_param") tps
   rs_params <- traverse (newParam "rs_param") tps
-  ds_params <- traverse (newParam "ds_param") tps
-  let map_params = ds_params <> ls_params <> as_params <> rs_params
+  let map_params = ls_params <> as_params <> rs_params
   lam_map <- mkLambda map_params $
     fmap varsRes . letTupExp "map_f" $
       Op $ Screma n (map paramName map_params) $ mapSOAC lam'
@@ -120,7 +115,7 @@ mapout is n w = do
       eIf
         (toExp $ withinBounds $ pure (w, paramName par_is))
         (eBody $ pure $ eParam par_is)
-        (eBody $ pure $ toExp (pe64 w + 1))
+        (eBody $ pure $ eSubExp w)
 
   letExp "is'" $ Op $ Screma n (pure is) $ mapSOAC is'_lam
 
@@ -659,28 +654,30 @@ radixSort' xs n w = do
 --
 -- generic case of histogram.
 -- Original, assuming `is: [n]i64` and `dst: [w]btp`
---     let xs = reduce_by_index dst odot ne is as
+  --   let xs = reduce_by_index dst odot ne is as
 -- Forward sweep:
-  -- let h_part = reduce_by_index nes odot ne is as
+  -- let h_part = reduce_by_index (replicate w ne) odot ne is as
   -- let xs = map2 odot dst h_part
 -- Reverse sweep:
+  -- h_part_bar += f'' dst h_part
   -- dst_bar += f' dst h_part
+  
   -- let flag = map (\i -> i == 0 || sis[i] != sis[i-1]) (iota n)
   -- let flag_rev = map (\i -> i==0 || flag[n-i]) (iota n)
   -- let ls = seg_scan_exc odot ne flag sas
   -- let rs = reverse sas |> 
   --          seg_scan_exc odot ne flag_rev |> reverse
-  -- let (f_bar, f_dst) = map (\i -> if i < w && -1 < w 
-  --                                then (xs_bar[i], dst[i]) 
-  --                                else (0s, ne))
-  --                          sis
+  -- let f_bar = map (\i -> if i < w && -1 < w 
+  --                        then h_part_bar[i]
+  --                        else 0s
+  --                 ) sis
   -- let sas_bar = f f_dst ls sas rs
   -- as_bar += scatter (Scratch alpha n) siota sas_bar
 -- Where:
---  nes = replicate w ne
---  siota is 'iota n' sorted wrt 'is'
---  sis is 'is' sorted wrt 'is'
---  sas is 'as' sorted wrt 'is'
+--  siota: 'iota n' sorted wrt 'is'
+--  sis: 'is' sorted wrt 'is'
+--  sas: 'as' sorted wrt 'is'
+--  f'' = vjpLambda xs_bar h_part (map2 odot)
 --  f' = vjpLambda xs_bar dst (map2 odot)
 --  f  = vjpLambda f_bar sas (map4 (\di li ai ri -> di odot li odot ai odot ri))
 --  0s is an alpha-dimensional array with 0 (possibly 0-dim)
@@ -707,12 +704,16 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
 
   xs_bar <- traverse lookupAdjVal xs
 
-  (dst_params, f') <- mkF' lam0 dst_type $ head w
-  f'_adj <- vjpLambda ops (map adjFromVar xs_bar) dst_params f'
+  (dst_params, hp_params, f') <- mkF' lam0 dst_type $ head w
+  f'_adj_dst <- vjpLambda ops (map adjFromVar xs_bar) dst_params f'
+  f'_adj_hp <- vjpLambda ops (map adjFromVar xs_bar) hp_params f'
 
-  dst_bar' <- eLambda f'_adj $ map (eSubExp . Var) $ dst <> h_part
+  dst_bar' <- eLambda f'_adj_dst $ map (eSubExp . Var) $ dst <> h_part
   dst_bar <- bindSubExpRes "dst_bar" dst_bar'
   zipWithM_ updateAdj dst dst_bar
+
+  h_part_bar' <- eLambda f'_adj_hp $ map (eSubExp . Var) $ dst <> h_part
+  h_part_bar <- bindSubExpRes "h_part_bar" h_part_bar'
 
   lam <- renameLambda lam0
   lam' <- renameLambda lam0
@@ -802,15 +803,12 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
     fmap varsRes . letTupExp "scan_res" =<<
       eIf
         (toExp $ withinBounds $ pure (head w, i''))
-        (eBody . fmap (eSubExp . Var) =<< multiIndex (xs_bar <> dst) [DimFix $ Var i''])
+        (eBody . fmap (eSubExp . Var) =<< multiIndex h_part_bar [DimFix $ Var i''])
         (eBody $ do
-          let xs_bar_ne = map (\t -> pure $ BasicOp $ Replicate (Shape $ tail $ arrayDims t) (Constant $ blankPrimValue $ elemType t)) as_type
-          let dst_ne = map eSubExp ne
-          xs_bar_ne <> dst_ne
+          map (\t -> pure $ BasicOp $ Replicate (Shape $ tail $ arrayDims t) (Constant $ blankPrimValue $ elemType t)) as_type
         )
 
-  f_bar_dst <- letTupExp "f_bar_dst" $ Op $ Screma n [sis] $ mapSOAC map_lam
-  let (f_bar, f_dst) = splitAt (length ne) f_bar_dst
+  f_bar <- letTupExp "f_bar" $ Op $ Screma n [sis] $ mapSOAC map_lam
 
   (as_params, f) <- mkF lam0 as_type n
   f_adj <- vjpLambda ops (map adjFromVar f_bar) as_params f
@@ -825,7 +823,7 @@ diffHist ops xs aux n lam0 ne as w rf dst m = do
   rs_arr <- letTupExp "rs_arr" $ Op $ Screma n [iota_n] $ mapSOAC rev_lam
 
   sas_bar <- bindSubExpRes "sas_bar" =<<
-    eLambda f_adj (map (eSubExp . Var) $ f_dst <> ls_arr <> sas <> rs_arr)
+    eLambda f_adj (map (eSubExp . Var) $ ls_arr <> sas <> rs_arr)
 
   scatter_dst <- traverse (\t -> letExp "scatter_dst" $ BasicOp $ Scratch (elemType t) (arrayDims t)) as_type
   as_bar <- multiScatter n scatter_dst siota sas_bar

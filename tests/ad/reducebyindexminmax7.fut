@@ -1,6 +1,6 @@
 -- ==
 -- entry: compare
--- random input { [500]i64 [100][100]f32 [500][100]f32 } output { true }
+-- random input { [500]i64 [100][30]f32 [500][30]f32 } output { true }
 
 -- ==
 -- entry: compare2
