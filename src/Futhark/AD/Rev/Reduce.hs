@@ -7,6 +7,8 @@
 module Futhark.AD.Rev.Reduce
   ( diffReduce,
     diffMinMaxReduce,
+    diffRedMapInterchange,
+    diffMulReduce,
   )
 where
 
@@ -15,6 +17,7 @@ import Futhark.AD.Rev.Monad
 import Futhark.Analysis.PrimExp.Convert
 import Futhark.Builder
 import Futhark.IR.SOACS
+import Futhark.IR.Primitive
 import Futhark.Tools
 import Futhark.Transform.Rename
 
@@ -202,3 +205,138 @@ diffMinMaxReduce _ops x aux w minmax ne as m = do
     letSubExp "minmax_in_bounds" . BasicOp $
       CmpOp (CmpSlt Int64) (intConst Int64 0) w
   updateAdjIndex as (CheckBounds (Just in_bounds), Var x_ind) (Var x_adj)
+  
+--
+-- Special case of reduce with vectorised min/max:
+--    let x = reduce (map2 minmax) nes as
+-- Idea: 
+--    rewrite to
+--      let x = map2 (\as ne -> reduce minmax ne as) (transpose as) nes
+--    and diff
+-- diffVecMinMaxOrMulReduce ::
+diffRedMapInterchange ::
+  VjpOps -> Pat -> StmAux () -> SubExp -> SubExp -> Commutativity -> BinOp -> VName -> VName -> ADM () -> ADM ()
+diffRedMapInterchange _ops x aux w n iscomm op ne as m = do
+  let t = binOpType op
+  op_lam <- binOpLambda op t
+  
+  stms <- collectStms_ $ do
+    tran_as <- letExp "tran_as" $ BasicOp $ Rearrange [1,0] as
+  
+    a_param <- newParam "a" $ Array t (Shape [w]) NoUniqueness
+    ne_param <- newParam "ne" $ Prim t
+
+    -- 'iscomm' is commutative if supplied by user. (e.g. reduce_comm (map2 (binop)))
+    -- if the (map2(binop)) is commutative then binop is also commutative.
+    -- if user has not supplied this information (e.g. use reduce and not reduce_comm),
+    -- it looks like it will be checked later on if binop is one of the 'known' commutative ones.
+    -- It could be checked using 'Futhark.IR.Primitive.commutativeBinOp'
+    reduce_form <- reduceSOAC [Reduce iscomm op_lam [Var $ paramName ne_param]]
+  
+    map_lam <- mkLambda [a_param, ne_param] $ fmap varsRes . letTupExp "idx_res" $ Op $ Screma w [paramName a_param] reduce_form
+    addStm $ Let x aux $ Op $ Screma n [tran_as, ne] $ mapSOAC map_lam
+    
+  foldr (vjpStm _ops) m stms
+
+--
+-- Special case of reduce with mul:
+--    let x = reduce (*) ne as
+-- Forward trace (assuming w = length as):
+--    let (p, z) = map (\a -> if a == 0 then (1, 1) else (a, 0)) as
+--    prodnonzeros = reduce (*) ne p
+--    zeros = reduce (+) 0 z
+--    let x = 
+--      if 0 == zeros
+--      then prodnonzeros
+--      else 0
+-- Reverse trace:
+--    as_bar = map2 
+--      (\a a_bar ->
+--        if zeros == 0
+--        then a_bar + prodnonzeros/a * x_bar
+--        else if zeros == 1
+--        then a_bar + (if a == 0 then prodnonzeros * x_bar else 0)
+--        else as_bar
+--      ) as as_bar
+diffMulReduce ::
+  VjpOps -> VName -> StmAux () -> SubExp -> BinOp -> SubExp -> VName -> ADM () -> ADM ()
+diffMulReduce _ops x aux w mul ne as m = do
+  let t = binOpType mul
+  
+  a_param <- newParam "a" $ Prim t
+
+  map_lam <-  
+    mkLambda [a_param] $
+      fmap varsRes . letTupExp "map_res" =<<
+        eIf
+          (eCmpOp (CmpEq t) (eParam  a_param) (eSubExp $ mkConst t 0))
+          (eBody $ fmap eSubExp [mkConst t 1, intConst Int64 1])
+          (eBody [eParam a_param, eSubExp $ intConst Int64 0])
+
+  ps <- newVName "ps"
+  zs <- newVName "zs"
+
+  auxing aux $ 
+    letBindNames [ps, zs] $ 
+      Op $ Screma w [as] $ mapSOAC map_lam
+        
+  red_lam_mul <- binOpLambda mul t 
+  red_lam_add <- binOpLambda (Add Int64 OverflowUndef) int64
+
+  red_form_mul <- reduceSOAC $ return $ Reduce Commutative red_lam_mul $ return ne
+  red_form_add <- reduceSOAC $ return $ Reduce Commutative red_lam_add $ return $ intConst Int64 0
+
+  prodnonzeroes <- newVName "prodnonzeros"
+  zeros <- newVName "zeros"
+
+  auxing aux $ letBindNames [prodnonzeroes] $ Op $ Screma w [ps] red_form_mul
+  auxing aux $ letBindNames [zeros] $ Op $ Screma w [zs] red_form_add
+
+  auxing aux $
+    letBindNames [x] =<<
+      eIf 
+        (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 0) (eSubExp $ Var zeros))
+        (eBody $ return $ eSubExp $ Var prodnonzeroes)
+        (eBody $ return $ eSubExp $ mkConst t 0)
+
+  m
+
+  x_adj <- lookupAdjVal x
+
+  a_param_rev <- newParam "a" $ Prim t
+  map_lam_rev <- 
+    mkLambda [a_param_rev] $
+      fmap varsRes . letTupExp "adj_res" =<<
+        eIf
+          (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 0) (eSubExp $ Var zeros))
+          (eBody $ return $
+             eBinOp mul 
+               (eSubExp $ Var x_adj) (
+                  eBinOp (getDiv t) (eSubExp $ Var prodnonzeroes) 
+                  (eParam a_param_rev))
+          )
+          (eBody $ return $
+             eIf
+             (eCmpOp (CmpEq int64) (eSubExp $ intConst Int64 1) (eSubExp $ Var zeros))
+             (eBody $ return $
+                eIf 
+                (eCmpOp (CmpEq t) (eParam a_param_rev) (eSubExp $ mkConst t 0))
+                (eBody $ return $
+                   eBinOp mul (eSubExp $ Var x_adj) (eSubExp $ Var prodnonzeroes)
+                )
+                (eBody $ return $ eSubExp $ mkConst t 0)
+             )
+             (eBody $ return $ eSubExp $ mkConst t 0)
+          )
+
+  as_adjup <- letExp "adjs" $ Op $ Screma w [as] $ mapSOAC map_lam_rev
+
+  updateAdj as as_adjup
+  
+  where
+    mkConst :: PrimType -> Integer -> SubExp
+    mkConst (IntType t) = intConst t
+    mkConst (FloatType t) = floatConst t . fromIntegral
+    getDiv :: PrimType -> BinOp
+    getDiv (IntType t) = SDiv t Unsafe
+    getDiv (FloatType t) = FDiv t

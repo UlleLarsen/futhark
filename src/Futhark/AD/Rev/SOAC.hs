@@ -18,6 +18,7 @@ import Futhark.Builder
 import Futhark.IR.SOACS
 import Futhark.Tools
 import Futhark.Util (chunks)
+import Data.List (find)
 
 -- We split any multi-op scan or reduction into multiple operations so
 -- we can detect special cases.  Post-AD, the result may be fused
@@ -103,8 +104,27 @@ histomapToMapAndHist (Pat pes) (w, histops, map_lam, as) = do
     accMapPatElem =
       newIdent "hist_map_res" . (`arrayOfRow` w)
 
+lamIsMap :: Lambda -> Maybe [ScremaForm SOACS]
+lamIsMap lam = mapM splitStm $ bodyResult $ lambdaBody lam
+  where
+    splitStm (SubExpRes cs (Var res)) = do
+      guard $ cs == mempty
+      Let _ _ (Op (Screma _ _ sf)) <-
+        find (([res] ==) . patNames . stmPat) $
+          stmsToList $ bodyStms $ lambdaBody lam
+      return sf
+    splitStm _ = Nothing
+
 vjpSOAC :: VjpOps -> Pat Type -> StmAux () -> SOAC SOACS -> ADM () -> ADM ()
 vjpSOAC ops pat aux soac@(Screma w as form) m
+  | Just [red] <- isReduceSOAC form,
+    iscomm <- redComm red,  -- if reduce_comm futhark should obey. (map2(binop)) commutative => binop commutative
+    [Var ne] <- redNeutral red,
+    [a] <- as,
+    Just [sf] <- lamIsMap $ redLambda red, 
+    Just [(op, _, _, _)] <- lamIsBinOp =<< isMapSOAC sf,
+    [Array _ (Shape [n]) _] <- lambdaReturnType $ redLambda red = 
+    diffRedMapInterchange ops pat aux w n iscomm op ne a m
   | Just reds <- isReduceSOAC form,
     length reds > 1 =
       splitScanRed ops (reduceSOAC, redNeutral) (pat, aux, reds, w, as) m
@@ -115,6 +135,13 @@ vjpSOAC ops pat aux soac@(Screma w as form) m
     Just [(op, _, _, _)] <- lamIsBinOp $ redLambda red,
     isMinMaxOp op =
       diffMinMaxReduce ops x aux w op ne a m
+  | Just [red] <- isReduceSOAC form,
+    [x] <- patNames pat,
+    [ne] <- redNeutral red,
+    [a] <- as,
+    Just [(op, _, _, _)] <- lamIsBinOp $ redLambda red,
+    isMulOp op =
+    diffMulReduce ops x aux w op ne a m
   | Just red <- singleReduce <$> isReduceSOAC form = do
     pat_adj <- mapM adjVal =<< commonSOAC pat aux soac m
     diffReduce ops pat_adj w as red
