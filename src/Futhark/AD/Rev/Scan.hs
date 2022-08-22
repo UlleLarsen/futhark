@@ -137,7 +137,6 @@ mkScanLinFunO t s = do
 
     let t0 = linFunT0 a1s' a2s' b2sm s pt
     let t1 = concat $ matrixMul b2sm b1sm pt
-    --error $ show d ++ " " ++ show (length t0) ++ " " ++ show (length t1) ++ " " ++ show (fmap length [a1s', a2s', concat b2sm])
     traverse (letSubExp "r" <=< toExp) $ t0 ++ t1
 
   pure $ Scan lam neu_elm
@@ -263,7 +262,6 @@ diffScan ops ys w as scan = do
   r_scan <-
     letTupExp "adj_ctrb_scan" $
       Op $ Screma w [iota] $ ScremaForm scan_lams [] map1_lam
-  -- red_nms <- mkScan2ndMaps w d (head as_ts, orderArgs sc ys_adj, splitScanRes sc r_scan d) sc
 
   as_contribs <- mkScanFinalMap ops w (scanLambda scan) as ys (splitScanRes sc r_scan d) (head as_ts)
   zipWithM_ updateAdj as as_contribs
@@ -274,8 +272,6 @@ diffScan ops ys w as scan = do
         lam' <- renameLambda $ scanLambda s
         pure $ Scan lam' $ scanNeutral s
 
-    -- splitScanRes sc res d =
-    --   splitAt (div d $ specialScans sc) <$> orderArgs sc res
     splitScanRes sc res d =
       concat $ take (div d $ specialScans sc) <$> orderArgs sc res
 
