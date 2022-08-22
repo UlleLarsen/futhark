@@ -107,7 +107,7 @@ mkScanFusedMapLam ops w scn_lam xs ys ys_adj s d = do
     case_jac :: Int -> SpecialCase -> [[a]] -> [[a]]
     case_jac _ Generic jac = jac
     case_jac k ZeroQuadrant jac =
-      concat $ zipWith (\i -> 
+      concat $ zipWith (\i ->
         map (take k . drop (i*k))) [0..d `div` k] $ splitEvery k jac
     case_jac k MatrixMul jac =
       take k <$> take k jac
@@ -140,7 +140,7 @@ mkScanLinFunO t s = do
     --error $ show d ++ " " ++ show (length t0) ++ " " ++ show (length t1) ++ " " ++ show (fmap length [a1s', a2s', concat b2sm])
     traverse (letSubExp "r" <=< toExp) $ t0 ++ t1
 
-  return $ Scan lam neu_elm
+  pure $ Scan lam neu_elm
   where
     mkNeutral (a,b) = do
       zeros <- replicateM a $ letSubExp "zeros" $ zeroExp $ rowType t

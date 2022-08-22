@@ -3,6 +3,8 @@
 {-# LANGUAGE MultiParamTypeClasses #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# OPTIONS_GHC -Wno-unrecognised-pragmas #-}
+{-# HLINT ignore "Use pure" #-}
 
 module Futhark.AD.Rev.SOAC (vjpSOAC) where
 
@@ -18,7 +20,6 @@ import Futhark.Builder
 import Futhark.IR.SOACS
 import Futhark.Tools
 import Futhark.Util (chunks)
-import Data.List (find)
 
 -- We split any multi-op scan or reduction into multiple operations so
 -- we can detect special cases.  Post-AD, the result may be fused
@@ -99,32 +100,17 @@ histomapToMapAndHist (Pat pes) (w, histops, map_lam, as) = do
   let map_stm = mkLet map_pat $ Op $ Screma w as $ mapSOAC map_lam
   new_lam <- mkIdentityLambda $ lambdaReturnType map_lam
   let hist_stm = Let (Pat pes) (defAux ()) $ Op $ Hist w (map identName map_pat) histops new_lam
-  return (map_stm, hist_stm)
+  pure (map_stm, hist_stm)
   where
     accMapPatElem =
       newIdent "hist_map_res" . (`arrayOfRow` w)
 
-lamIsMap :: Lambda -> Maybe [ScremaForm SOACS]
-lamIsMap lam = mapM splitStm $ bodyResult $ lambdaBody lam
-  where
-    splitStm (SubExpRes cs (Var res)) = do
-      guard $ cs == mempty
-      Let _ _ (Op (Screma _ _ sf)) <-
-        find (([res] ==) . patNames . stmPat) $
-          stmsToList $ bodyStms $ lambdaBody lam
-      return sf
-    splitStm _ = Nothing
-
 vjpSOAC :: VjpOps -> Pat Type -> StmAux () -> SOAC SOACS -> ADM () -> ADM ()
 vjpSOAC ops pat aux soac@(Screma w as form) m
-  | Just [red] <- isReduceSOAC form,
-    iscomm <- redComm red,  -- if reduce_comm futhark should obey. (map2(binop)) commutative => binop commutative
-    [Var ne] <- redNeutral red,
+  | Just [Reduce iscomm lam [Var ne]] <- isReduceSOAC form,
     [a] <- as,
-    Just [sf] <- lamIsMap $ redLambda red, 
-    Just [(op, _, _, _)] <- lamIsBinOp =<< isMapSOAC sf,
-    [Array _ (Shape [n]) _] <- lambdaReturnType $ redLambda red = 
-    diffRedMapInterchange ops pat aux w n iscomm op ne a m
+    Just op <- mapOp lam = 
+    diffVecReduce ops pat aux w iscomm op ne a m
   | Just reds <- isReduceSOAC form,
     length reds > 1 =
       splitScanRed ops (reduceSOAC, redNeutral) (pat, aux, reds, w, as) m
